@@ -27,9 +27,12 @@ from lmcache.experimental.gpu_connector import (
     GPUConnectorInterface, VLLMPagedMemLayerwiseGPUConnector)
 from lmcache.experimental.lookup_server import (LookupServerInterface,
                                                 RedisLookupServer)
-from lmcache.experimental.memory_management import (  # noqa: E501
-    AdHocMemoryAllocator, MemoryAllocatorInterface, MemoryFormat, MemoryObj,
-    MixedMemoryAllocator)
+from lmcache.experimental.memory_management import (AdHocMemoryAllocator,
+                                                    MemoryAllocatorInterface,
+                                                    MemoryFormat,
+                                                    MemoryObj,
+                                                    MixedMemoryAllocator,
+                                                    GPUTemporaryMemoryAllocator)
 from lmcache.experimental.storage_backend.storage_manager import (
     DistributedStorageManager, StorageManager)
 from lmcache.experimental.token_database import (ChunkedTokenDatabase,
@@ -231,6 +234,7 @@ class LMCacheEngine:
         else:
             num_stored_tokens = len(tokens)
         monitor_req_id = self.stats_monitor.on_store_request(num_stored_tokens)
+        st = time.perf_counter()
 
         for start, end, key in self.token_database.process_tokens(
                 tokens, mask):
@@ -254,10 +258,11 @@ class LMCacheEngine:
             if self.lookup_server is not None:
                 self.lookup_server.insert(key)
 
+        ed = time.perf_counter()
         self.stats_monitor.on_store_finished(monitor_req_id)
-
         logger.debug(f"Stored {num_stored_tokens} "
-                     f"out of total {len(tokens)} tokens")
+                     f"out of total {len(tokens)} tokens "
+                     f"in {ed - st:.4f} seconds.")
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -286,6 +291,7 @@ class LMCacheEngine:
         :raises: ValueError if the number of Falses in the mask is not a 
             multiple of the chunk size.
         """
+        st = time.perf_counter()
         if mask is not None:
             num_required_tokens = torch.sum(mask).item()
         else:
@@ -327,11 +333,13 @@ class LMCacheEngine:
                 self.storage_manager.remove(key)
 
         retrieved_tokens = torch.sum(ret_mask)
+        ed = time.perf_counter()
         self.stats_monitor.on_retrieve_finished(monitor_req_id,
                                                 retrieved_tokens)
         logger.debug(f"Retrieved {retrieved_tokens} "
                      f"out of {num_required_tokens} "
-                     f"out of total {len(tokens)} tokens")
+                     f"out of total {len(tokens)} tokens "
+                     f"in {ed - st:.4f} seconds.")
         return ret_mask
 
     def prefetch(
@@ -721,6 +729,8 @@ class LMCacheEngineBuilder:
             assert config.nixl_buffer_device is not None
             return AdHocMemoryAllocator(config.nixl_buffer_device)
 
+        if config.local_cpu is False:
+            return GPUTemporaryMemoryAllocator()
         max_local_cpu_size = config.max_local_cpu_size
         return MixedMemoryAllocator(int(max_local_cpu_size * 1024**3))
 

@@ -13,7 +13,10 @@
 # limitations under the License.
 
 import hashlib
+import os
 import threading
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -181,3 +184,31 @@ def thread_safe(func):
             return func(*args, **kwargs)
 
     return wrapper
+
+
+##### Miscellaneous utilities ####
+def is_envvar_enabled(var: str) -> bool:
+    return os.environ.get(
+        var, "").strip().lower() in {"1", "true", "on", "enable", "enabled"}
+
+
+##### Context manager to collect timing of the code block.
+##### If `stats` is None, does nothing, otherwise `stats` must
+##### have `agg` field that supports `update` method (usually
+##### `datasketches.kll_*_sketch`) and possibly `acc` field.
+##### Measured time is passed to `stats.agg.update` and added
+##### to `stats.acc` if `acc` is not None.
+@contextmanager
+def timing(stats, agg: str, acc: str | None = None):
+    if not stats:
+        yield None
+    else:
+        try:
+            start = time.perf_counter()
+            yield None
+        finally:
+            end = time.perf_counter()
+            measured = end - start
+            getattr(stats, agg).update(measured)
+            if acc:
+                setattr(stats, acc, getattr(stats, acc) + measured)

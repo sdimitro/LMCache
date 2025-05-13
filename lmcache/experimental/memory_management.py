@@ -955,3 +955,48 @@ class AdHocMemoryAllocator(MemoryAllocatorInterface):
 
     def memcheck(self):
         return True
+
+class GPUTemporaryMemoryAllocator(MemoryAllocatorInterface):
+    def __init__(self, device="cuda"):
+        # Replace 'cuda' with 'cuda:<device id>'
+        if device == "cuda":
+            device = f"cuda:{torch.cuda.current_device()}"
+
+        self.device = device
+
+    def allocate(
+        self,
+        shape: Union[torch.Size, Tuple[int, ...]],
+        dtype: Optional[torch.dtype],
+        fmt: MemoryFormat = MemoryFormat.KV_BLOB,
+    ) -> Optional[MemoryObj]:
+        raw_data = torch.empty(shape, dtype=dtype, device=self.device)
+        metadata = MemoryObjMetadata(shape, dtype, 0, 0, 1, fmt)
+        return TensorMemoryObj(raw_data, metadata)
+
+    def free(self, memory_obj: MemoryObj):
+        return
+
+    def ref_count_up(self, memory_obj: MemoryObj):
+        pass
+
+    def ref_count_down(self, memory_obj: MemoryObj):
+        pass
+
+    def get_ref_count(self, memory_obj: MemoryObj):
+        return -1
+
+    def memcheck(self):
+        return True
+    
+    def dry_allocate(
+        self,
+        shape: Union[torch.Size, Tuple[int, ...]],
+        dtype: Optional[torch.dtype],
+        fmt: MemoryFormat = MemoryFormat.KV_BLOB,
+    ) -> MemoryObjMetadata:
+        """
+        Returns a dummy MemoryObjMetadata for testing purposes.
+        """
+        metadata = MemoryObjMetadata(shape, dtype, 0, 0, 1, fmt)
+        return metadata

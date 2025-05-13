@@ -250,6 +250,8 @@ class LMCacheEngineConfig:
                 pass
             case url if re.match(r"(.*)://(.*):(\d+)", url):
                 pass
+            case url if url.startswith("weka://"): # TODO(Serapheim): Is this really needed if we have the above?
+                pass
             case _:
                 raise ValueError(f"Invalid remote storage url: {remote_url}")
 
