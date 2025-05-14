@@ -500,8 +500,9 @@ class WekaGdsBackend(StorageBackendInterface):
                                                    dtype=dtype,
                                                    shape=shape)
         if self.stats:
-            self.stats.get_count += 1
-            self.stats.total_read_size += memory_obj.get_size()
+            if memory_obj is not None:
+                self.stats.get_count += 1
+                self.stats.total_read_size += memory_obj.get_size()
         return memory_obj
 
     @_lmcache_nvtx_annotate
