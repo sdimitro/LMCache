@@ -973,7 +973,13 @@ class GPUTemporaryMemoryAllocator(MemoryAllocatorInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
     ) -> Optional[MemoryObj]:
         raw_data = torch.empty(shape, dtype=dtype, device=self.device)
-        metadata = MemoryObjMetadata(shape, dtype, 0, 0, 1, fmt)
+        metadata = MemoryObjMetadata(shape=shape,
+                                     dtype=dtype,
+                                     address=0,
+                                     phy_size=0,
+                                     ref_count=1,
+                                     is_pin=False,
+                                     fmt=fmt)
         return TensorMemoryObj(raw_data, metadata)
 
     def free(self, memory_obj: MemoryObj):
@@ -1000,5 +1006,11 @@ class GPUTemporaryMemoryAllocator(MemoryAllocatorInterface):
         """
         Returns a dummy MemoryObjMetadata for testing purposes.
         """
-        metadata = MemoryObjMetadata(shape, dtype, 0, 0, 1, fmt)
+        metadata = MemoryObjMetadata(shape=shape,
+                                     dtype=dtype,
+                                     address=0,
+                                     phy_size=0,
+                                     ref_count=1,
+                                     is_pin=False,
+                                     fmt=fmt)
         return metadata
