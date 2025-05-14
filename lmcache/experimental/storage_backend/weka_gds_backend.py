@@ -292,7 +292,7 @@ class WekaGdsBackend(StorageBackendInterface):
 
         self.use_thread_pool = is_envvar_enabled("WEKA_GDS_USE_THREAD_POOL")
         asyncio.run_coroutine_threadsafe(self.scan_metadata(), self.loop)
-        self.save_metadata_tasks = set()
+        self.save_metadata_tasks: set[asyncio.Task] = set()
 
     def __str__(self):
         return self.__class__.__name__
