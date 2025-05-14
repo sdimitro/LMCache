@@ -956,7 +956,9 @@ class AdHocMemoryAllocator(MemoryAllocatorInterface):
     def memcheck(self):
         return True
 
+
 class GPUTemporaryMemoryAllocator(MemoryAllocatorInterface):
+
     def __init__(self, device="cuda"):
         # Replace 'cuda' with 'cuda:<device id>'
         if device == "cuda":
@@ -968,7 +970,7 @@ class GPUTemporaryMemoryAllocator(MemoryAllocatorInterface):
         self,
         shape: Union[torch.Size, Tuple[int, ...]],
         dtype: Optional[torch.dtype],
-        fmt: MemoryFormat = MemoryFormat.KV_BLOB,
+        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
     ) -> Optional[MemoryObj]:
         raw_data = torch.empty(shape, dtype=dtype, device=self.device)
         metadata = MemoryObjMetadata(shape, dtype, 0, 0, 1, fmt)
@@ -988,12 +990,12 @@ class GPUTemporaryMemoryAllocator(MemoryAllocatorInterface):
 
     def memcheck(self):
         return True
-    
+
     def dry_allocate(
         self,
         shape: Union[torch.Size, Tuple[int, ...]],
         dtype: Optional[torch.dtype],
-        fmt: MemoryFormat = MemoryFormat.KV_BLOB,
+        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
     ) -> MemoryObjMetadata:
         """
         Returns a dummy MemoryObjMetadata for testing purposes.

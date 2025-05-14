@@ -72,8 +72,8 @@ def CreateStorageBackends(
     if config.remote_url is not None:
         if config.remote_url.startswith("weka://"):
             from lmcache.experimental.storage_backend.weka_gds_backend import WekaGdsBackend
-            remote_backend = WekaGdsBackend(config, loop,
-                                            memory_allocator, dst_device)
+            remote_backend = WekaGdsBackend(config, loop, memory_allocator,
+                                            dst_device)
         else:
             remote_backend = RemoteBackend(config, metadata, loop,
                                            memory_allocator, dst_device,

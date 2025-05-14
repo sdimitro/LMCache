@@ -46,10 +46,13 @@ _METADATA_VERSION = 1
 logger = init_logger(__name__)
 
 
-def load_gds(gpu_pci:str, file_path:str, file_offset:int, gpu_pointer, size_in_bytes:int) -> int:
+def load_gds(gpu_pci: str, file_path: str, file_offset: int, gpu_pointer,
+             size_in_bytes: int) -> int:
     """Load GPU buffer data from disk."""
     # Read data from disk into a CPU buffer
-    return gds_api_write_to_gds(gpu_pci, file_path, file_offset, gpu_pointer, size_in_bytes)
+    return gds_api_write_to_gds(gpu_pci, file_path, file_offset, gpu_pointer,
+                                size_in_bytes)
+
 
 # TODO(ilya): move metadata serialization somewhere else
 torch_dtypes = [
@@ -65,35 +68,48 @@ torch_dtypes = [
     torch.float8_e5m2,
 ]
 
-dtype_to_idx = { dtype: idx for idx, dtype in enumerate(torch_dtypes) }
+dtype_to_idx = {dtype: idx for idx, dtype in enumerate(torch_dtypes)}
+
 
 def rand_suffix(rand, n: int):
-    return ''.join(rand.choice(string.ascii_uppercase + string.digits) for _ in range(n))
+    return ''.join(
+        rand.choice(string.ascii_uppercase + string.digits) for _ in range(n))
+
 
 def metadata_max_size():
     return 4096  # reserve 4KB for metadata
+
 
 def pack_metadata(shape, dtype, size) -> bytes:
     metadata_desc = "<QQQQ" + len(shape) * "Q"
     if struct.calcsize(metadata_desc) > metadata_max_size():
         # TODO(ilya): support variable offset for data
-        raise ValueError(f"Metadata size {struct.calcsize(metadata_desc)} exceeds max size {metadata_max_size()}")
-    return struct.pack(metadata_desc, _METADATA_VERSION, dtype_to_idx[dtype], size, len(shape), *shape)
+        raise ValueError(
+            f"Metadata size {struct.calcsize(metadata_desc)} exceeds max size {metadata_max_size()}"
+        )
+    return struct.pack(metadata_desc, _METADATA_VERSION, dtype_to_idx[dtype],
+                       size, len(shape), *shape)
+
 
 class UnsupportedMetadataVersion(Exception):
     pass
+
 
 def unpack_metadata(buffer):
     version, dt_idx, size, ndim = struct.unpack_from("<QQQQ", buffer)
     shape_offset = struct.calcsize("<QQQQ")
     if version != _METADATA_VERSION:
-        raise UnsupportedMetadataVersion(f"Unsupported metadata version: {version}")  # TODO(ilya): add support for older versions
+        raise UnsupportedMetadataVersion(
+            f"Unsupported metadata version: {version}"
+        )  # TODO(ilya): add support for older versions
     shape = struct.unpack_from("<" + ndim * "Q", buffer, offset=shape_offset)
     return torch.Size(shape), torch_dtypes[dt_idx], size
 
+
 @_lmcache_nvtx_annotate
 @torch.inference_mode()
-def save_gds(gpu_pci,
+def save_gds(
+    gpu_pci,
     path: str,
     tmp: str,
     kv_chunk: torch.Tensor,
@@ -103,19 +119,18 @@ def save_gds(gpu_pci,
     metadata = pack_metadata(kv_chunk.shape, kv_chunk.dtype, kv_chunk.nbytes)
     with open(tmp_path, "wb") as f:
         f.write(metadata)
-    gds_api_read_from_gds(gpu_pci, tmp_path, offset, kv_chunk.data_ptr(), kv_chunk.nbytes)
+    gds_api_read_from_gds(gpu_pci, tmp_path, offset, kv_chunk.data_ptr(),
+                          kv_chunk.nbytes)
     os.rename(tmp_path, path)
     return metadata
 
-async def save_metadata(
-    path: str,
-    tmp: str,
-    metadata: bytes
-):
+
+async def save_metadata(path: str, tmp: str, metadata: bytes):
     tmp_path = path + tmp
     async with aiofile.async_open(tmp_path, "wb") as f:
         await f.write(metadata)
     os.rename(tmp_path, path)
+
 
 # TODO: find a better way, running an external command is an overkill,
 # the data is already there, just not accessible from Python...
@@ -123,16 +138,23 @@ def get_dev_pci(device: str):
     # TODO: this is dumb, but I don't see a way to get an index back from torch.device...
     parts = device.split(":")
     idx = parts[1] if len(parts) > 1 else "0"
-    res = subprocess.run(f"/usr/bin/nvidia-smi -i {idx} --query-gpu=pci.bus_id --format=csv,noheader",
-                         capture_output=True, text=True, check=True, shell=True)
+    res = subprocess.run(
+        f"/usr/bin/nvidia-smi -i {idx} --query-gpu=pci.bus_id --format=csv,noheader",
+        capture_output=True,
+        text=True,
+        check=True,
+        shell=True)
     output = res.stdout.strip()
     # TODO: for now drop the first part and convert to lower, to match what GDS implementation expects
     pci_id = output.split(":", 1)[1].lower()
     logger.debug(f"Device PCI ID: {pci_id}")
     return pci_id
 
+
 # TODO(ilya): this is almost the same as in local_backend, find a way to unify
 stats_compression = 100
+
+
 @dataclass
 class GDSStats:
     get_count = 0
@@ -150,27 +172,39 @@ class GDSStats:
     total_put_b_write_time = 0
 
     def _print_times(self, name, td):
-        logger.info("{name} time (min/median/90pt/max), ms: {mn:.3f}/{med:.3f}/{pt90:.3f}/{mx:.3f}".format(
-                       name = name, mn = td.get_min_value() * 1000, med = td.get_quantile(0.5) * 1000,
-                       pt90 = td.get_quantile(0.9) * 1000, mx = td.get_max_value() * 1000))
+        logger.info(
+            "{name} time (min/median/90pt/max), ms: {mn:.3f}/{med:.3f}/{pt90:.3f}/{mx:.3f}"
+            .format(name=name,
+                    mn=td.get_min_value() * 1000,
+                    med=td.get_quantile(0.5) * 1000,
+                    pt90=td.get_quantile(0.9) * 1000,
+                    mx=td.get_max_value() * 1000))
+
     def _print_throughput(self, name, size, acc):
         logger.info(f"{name} throughput: {size/1024/1024/acc} MB/s")
 
     def display(self):
-        logger.info(f"Number of gets: {self.get_count}, total read size: {self.total_read_size/1024/1024} MB, total time spent in reads: {self.total_read_time} s")
+        logger.info(
+            f"Number of gets: {self.get_count}, total read size: {self.total_read_size/1024/1024} MB, total time spent in reads: {self.total_read_time} s"
+        )
         if self.get_count:
             self._print_times("get", self.get_time)
-            self._print_throughput("get", self.total_read_size, self.total_read_time)
+            self._print_throughput("get", self.total_read_size,
+                                   self.total_read_time)
             self._print_times("gds read", self.gds_read_time)
-            self._print_throughput("gds read", self.total_read_size, self.total_gds_read_time)
+            self._print_throughput("gds read", self.total_read_size,
+                                   self.total_gds_read_time)
 
-        logger.info(f"Number of puts: {self.put_b_count}, total write size: {self.total_put_b_size/1024/1024} MB, total time spent in writes: {self.total_put_b_time} s")
+        logger.info(
+            f"Number of puts: {self.put_b_count}, total write size: {self.total_put_b_size/1024/1024} MB, total time spent in writes: {self.total_put_b_time} s"
+        )
         if self.put_b_count:
             self._print_times("put", self.put_b_time)
-            self._print_throughput("put", self.total_put_b_size, self.total_put_b_time)
+            self._print_throughput("put", self.total_put_b_size,
+                                   self.total_put_b_time)
             self._print_times("gds write", self.put_b_write_time)
-            self._print_throughput("gds write", self.total_put_b_size, self.total_put_b_write_time)
-
+            self._print_throughput("gds write", self.total_put_b_size,
+                                   self.total_put_b_write_time)
 
 
 class WekaGdsBackend(StorageBackendInterface):
@@ -204,17 +238,25 @@ class WekaGdsBackend(StorageBackendInterface):
             pid = os.getpid()
             self.trace_file = f"{trace_file_base}.{pid}"
             trace_buffer_size = _DEFAULT_TRACE_BUFFER_SIZE
-            trace_buffer_size_str = os.environ.get("WEKA_GDS_TRACE_BUFFER_SIZE")
+            trace_buffer_size_str = os.environ.get(
+                "WEKA_GDS_TRACE_BUFFER_SIZE")
             if trace_buffer_size_str:
                 try:
                     trace_buffer_size = int(trace_buffer_size_str)
                 except ValueError:
                     logger.error(
-                        f"Invalid WEKA_GDS_TRACE_BUFFER_SIZE={trace_buffer_size_str}, using default value {trace_buffer_size}")
-            logger.info(f"Will save up to {trace_buffer_size} events to trace files with prefix {self.trace_file}")
-            signal.signal(signal.SIGUSR1, lambda signum, frame: self.signal_handler(signum, frame))
-            self.sigterm = signal.signal(signal.SIGTERM, lambda signum, frame: self.signal_handler(signum, frame))
-        gds_api_init(event_buffer_size = trace_buffer_size)
+                        f"Invalid WEKA_GDS_TRACE_BUFFER_SIZE={trace_buffer_size_str}, using default value {trace_buffer_size}"
+                    )
+            logger.info(
+                f"Will save up to {trace_buffer_size} events to trace files with prefix {self.trace_file}"
+            )
+            signal.signal(
+                signal.SIGUSR1,
+                lambda signum, frame: self.signal_handler(signum, frame))
+            self.sigterm = signal.signal(
+                signal.SIGTERM,
+                lambda signum, frame: self.signal_handler(signum, frame))
+        gds_api_init(event_buffer_size=trace_buffer_size)
         self.dst_device_pci = get_dev_pci(dst_device)
         self.dst_device = dst_device
 
@@ -225,17 +267,15 @@ class WekaGdsBackend(StorageBackendInterface):
             self.stats = GDSStats()
         self.chunk_size = config.chunk_size
         self.config = config
-        self.dict: OrderedDict[CacheEngineKey, DiskCacheMetadata] = (
-            OrderedDict()
-        )
+        self.dict: OrderedDict[CacheEngineKey,
+                               DiskCacheMetadata] = (OrderedDict())
         self.path = config.remote_url[len("weka://"):]
         self.subdirs = set()
         self.rand = random.Random()
         self.rand.seed(self.dst_device_pci)
 
         assert self.path is not None, (
-            "Need to specify remote url if using WekaGdsBackend"
-        )
+            "Need to specify remote url if using WekaGdsBackend")
 
         if not os.path.exists(self.path):
             os.makedirs(self.path, exist_ok=True)
@@ -247,11 +287,10 @@ class WekaGdsBackend(StorageBackendInterface):
         self.put_lock = threading.Lock()
         self.memory_allocator = memory_allocator
         self.closed = False
-        
+
         self.use_thread_pool = is_envvar_enabled("WEKA_GDS_USE_THREAD_POOL")
         asyncio.run_coroutine_threadsafe(self.scan_metadata(), self.loop)
         self.save_metadata_tasks = set()
-
 
     def __str__(self):
         return self.__class__.__name__
@@ -265,22 +304,26 @@ class WekaGdsBackend(StorageBackendInterface):
             signal.raise_signal(signal.SIGTERM)
         else:
             logger.error(f"Unknown signal {signum} received")
-    
+
     def write_trace(self, reenable: bool = True):
         if self.trace_file:
-            gds_api_stop_profiling(f"{self.trace_file}.{self.trace_nr}.trace.json")
-            logger.info(f"Trace written to {self.trace_file}.{self.trace_nr}.trace.json")
+            gds_api_stop_profiling(
+                f"{self.trace_file}.{self.trace_nr}.trace.json")
+            logger.info(
+                f"Trace written to {self.trace_file}.{self.trace_nr}.trace.json"
+            )
             self.trace_nr += 1
             if reenable:
                 gds_api_start_profiling()
         else:
             logger.info("No trace file specified, not writing trace.")
-    
+
     def read_metadata(self, key, filename, subdirs):
         with open(filename, 'rb') as f:
             buf = f.read(metadata_max_size())
         shape, dtype, size = unpack_metadata(buf)
-        metadata = DiskCacheMetadata(filename.removesuffix(_METADATA_FILE_SUFFIX), size, shape, dtype)
+        metadata = DiskCacheMetadata(
+            filename.removesuffix(_METADATA_FILE_SUFFIX), size, shape, dtype)
         with self.update_lock:
             self.subdirs.add(subdirs)
             self.dict[key] = metadata
@@ -295,22 +338,28 @@ class WekaGdsBackend(StorageBackendInterface):
                         continue
                     with os.scandir(os.path.join(path, dirname)) as it2:
                         for fentry in it2:
-                            if fentry.is_file() and fentry.name.endswith(_DATA_FILE_SUFFIX + _METADATA_FILE_SUFFIX):
+                            if fentry.is_file() and fentry.name.endswith(
+                                    _DATA_FILE_SUFFIX + _METADATA_FILE_SUFFIX):
                                 filename = os.path.basename(fentry.name)
                                 key_str = filename[:-14].replace('_', '/')
                                 key = None
                                 try:
                                     key = CacheEngineKey.from_string(key_str)
                                 except ValueError as e:
-                                    logger.error(f"Filename {filename} can't be converted back into cache key: {e}")
+                                    logger.error(
+                                        f"Filename {filename} can't be converted back into cache key: {e}"
+                                    )
                                     continue
                                 # TODO(ilya): think if we want to check the main file is still there.
                                 # Normally we only write metadata file _after_ the main file, but
                                 # what if it was removed?
                                 try:
-                                    self.read_metadata(key, fentry.path, subdir + dirname)
+                                    self.read_metadata(key, fentry.path,
+                                                       subdir + dirname)
                                 except UnsupportedMetadataVersion:
-                                    logger.error(f"Unsupported metadata version for {fentry.path}, ignoring")
+                                    logger.error(
+                                        f"Unsupported metadata version for {fentry.path}, ignoring"
+                                    )
 
     async def scan_metadata(self):
         # TODO(ilya): even though we only run it once on startup, this is still not super scalable,
@@ -325,11 +374,15 @@ class WekaGdsBackend(StorageBackendInterface):
                         continue
 
                     tasks.append(
-                        asyncio.to_thread(self.scan_metadata_subdir, os.path.join(self.path, dirname), dirname))
+                        asyncio.to_thread(self.scan_metadata_subdir,
+                                          os.path.join(self.path, dirname),
+                                          dirname))
         # TODO(ilya): Can we switch to Python 3.11 and use TaskGroup instead?
         await asyncio.gather(*tasks)
         end = time.perf_counter()
-        logger.info(f"Read {len(self.dict)} cache entries from persistent storage in {end - start:.2f} seconds")
+        logger.info(
+            f"Read {len(self.dict)} cache entries from persistent storage in {end - start:.2f} seconds"
+        )
 
     def contains(
         self,
@@ -352,21 +405,23 @@ class WekaGdsBackend(StorageBackendInterface):
             return True
         return False
 
-    def _try_to_read_metadata(self, key: CacheEngineKey) -> Optional[DiskCacheMetadata]:
+    def _try_to_read_metadata(
+            self, key: CacheEngineKey) -> Optional[DiskCacheMetadata]:
         fl = key.chunk_hash[:2]
         sl = key.chunk_hash[2:4]
         path = self._key_to_path(key)
         if os.path.exists(path):
             try:
-                return self.read_metadata(key, path, sl+fl)
+                return self.read_metadata(key, path, sl + fl)
             except UnsupportedMetadataVersion:
-                logger.error(f"Unsupported metadata version for {path}, ignoring")
+                logger.error(
+                    f"Unsupported metadata version for {path}, ignoring")
         return None
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
         with self.put_lock:
             return key in self.put_tasks
-        
+
     def _key_to_path(
         self,
         key: CacheEngineKey,
@@ -386,9 +441,11 @@ class WekaGdsBackend(StorageBackendInterface):
         sl = hash[2:4]
         key_str = key.to_string()
         assert "_" not in key_str, "key string should not contain `_`"
-        return os.path.join(self.path, fl, sl, key_str.replace("/", "_") + _DATA_FILE_SUFFIX)
+        return os.path.join(self.path, fl, sl,
+                            key_str.replace("/", "_") + _DATA_FILE_SUFFIX)
 
-    def submit_put_task(self, key: CacheEngineKey, memory_obj: MemoryObj) -> Optional[Future]:
+    def submit_put_task(self, key: CacheEngineKey,
+                        memory_obj: MemoryObj) -> Optional[Future]:
         assert memory_obj.tensor is not None
 
         self.memory_allocator.ref_count_up(memory_obj)
@@ -414,7 +471,8 @@ class WekaGdsBackend(StorageBackendInterface):
         assert dtype is not None
         assert shape is not None
         future = asyncio.run_coroutine_threadsafe(
-            self.async_load_bytes_from_disk(key, path, dtype, shape), self.loop)
+            self.async_load_bytes_from_disk(key, path, dtype, shape),
+            self.loop)
         return future
 
     def get_blocking(
@@ -435,7 +493,10 @@ class WekaGdsBackend(StorageBackendInterface):
             shape = entry.shape
             assert dtype is not None
             assert shape is not None
-            memory_obj = self.load_bytes_from_disk(key, path, dtype=dtype, shape=shape)
+            memory_obj = self.load_bytes_from_disk(key,
+                                                   path,
+                                                   dtype=dtype,
+                                                   shape=shape)
         if self.stats:
             self.stats.get_count += 1
             self.stats.total_read_size += memory_obj.get_size()
@@ -463,14 +524,16 @@ class WekaGdsBackend(StorageBackendInterface):
             self.subdirs.add(subdir)
         tmp = '.tmp' + rand_suffix(self.rand, 8)
         if self.use_thread_pool:
-            metadata = await asyncio.to_thread(save_gds, self.dst_device_pci, path, tmp, kv_chunk)
+            metadata = await asyncio.to_thread(save_gds, self.dst_device_pci,
+                                               path, tmp, kv_chunk)
         else:
             metadata = save_gds(self.dst_device_pci, path, tmp, kv_chunk)
 
         self.insert_key(key, memory_obj)
         self.memory_allocator.ref_count_down(memory_obj)
 
-        task = asyncio.create_task(save_metadata(path + _METADATA_FILE_SUFFIX, tmp, metadata))
+        task = asyncio.create_task(
+            save_metadata(path + _METADATA_FILE_SUFFIX, tmp, metadata))
         self.save_metadata_tasks.add(task)
         task.add_done_callback(self.save_metadata_tasks.discard)
 
@@ -495,26 +558,34 @@ class WekaGdsBackend(StorageBackendInterface):
             return None
         assert memory_obj.tensor is not None
         assert memory_obj.tensor.is_cuda
-        assert torch.device(self.dst_device) == torch.device(memory_obj.tensor.device)
+        assert torch.device(self.dst_device) == torch.device(
+            memory_obj.tensor.device)
 
         offset = metadata_max_size()
         ret = 0
         if self.use_thread_pool:
-            ret = await asyncio.to_thread(load_gds, self.dst_device_pci, path, offset, memory_obj.tensor.data_ptr(), memory_obj.get_size())
+            ret = await asyncio.to_thread(load_gds, self.dst_device_pci, path,
+                                          offset, memory_obj.tensor.data_ptr(),
+                                          memory_obj.get_size())
         else:
-            ret = load_gds(self.dst_device_pci, path, offset, memory_obj.tensor.data_ptr(), memory_obj.get_size())
+            ret = load_gds(self.dst_device_pci, path, offset,
+                           memory_obj.tensor.data_ptr(), memory_obj.get_size())
         if ret != memory_obj.get_size():
             if ret < 0:
-                logger.error(f"Error loading {path}: {ret}, was the entry GCed? Removing it from cache")
+                logger.error(
+                    f"Error loading {path}: {ret}, was the entry GCed? Removing it from cache"
+                )
                 with self.update_lock:
                     self.dict.pop(key)
             else:
                 # TODO(ilya): we should probably count errors and remove the entry
                 # if it's a persistent problem
-                logger.error(f"Error loading {path}: got only {ret} bytes out of {memory_obj.get_size()}, ignoring")
+                logger.error(
+                    f"Error loading {path}: got only {ret} bytes out of {memory_obj.get_size()}, ignoring"
+                )
             self.memory_allocator.ref_count_down(memory_obj)
             return None
-            
+
         return memory_obj
 
     # TODO(Jiayi): use memory allocator to redeuce cpu buffer allocation
@@ -536,20 +607,26 @@ class WekaGdsBackend(StorageBackendInterface):
             return None
         assert memory_obj.tensor is not None
         assert memory_obj.tensor.is_cuda
-        assert torch.device(self.dst_device) == torch.device(memory_obj.tensor.device)
+        assert torch.device(self.dst_device) == torch.device(
+            memory_obj.tensor.device)
 
         offset = metadata_max_size()
         with timing(self.stats, 'gds_read_time', 'total_gds_read_time'):
-            ret = load_gds(self.dst_device_pci, path, offset, memory_obj.tensor.data_ptr(), memory_obj.get_size())
+            ret = load_gds(self.dst_device_pci, path, offset,
+                           memory_obj.tensor.data_ptr(), memory_obj.get_size())
         if ret != memory_obj.get_size():
             if ret < 0:
-                logger.error(f"Error loading {path}: {ret}, was the entry GCed? Removing it from cache")
+                logger.error(
+                    f"Error loading {path}: {ret}, was the entry GCed? Removing it from cache"
+                )
                 with self.update_lock:
                     self.dict.pop(key)
             else:
                 # TODO(ilya): we should probably count errors and remove the entry
                 # if it's a persistent problem
-                logger.error(f"Error loading {path}: got only {ret} bytes out of {memory_obj.get_size()}, ignoring")
+                logger.error(
+                    f"Error loading {path}: got only {ret} bytes out of {memory_obj.get_size()}, ignoring"
+                )
             self.memory_allocator.ref_count_down(memory_obj)
             return None
         return memory_obj
