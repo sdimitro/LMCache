@@ -301,13 +301,13 @@ class WekaGdsBackend(StorageBackendInterface):
         if signum == signal.SIGUSR1:
             self.write_trace()
         elif signum == signal.SIGTERM:
-            self.write_trace(reenable=False)
+            self.write_trace(re_enable=False)
             signal.signal(signal.SIGTERM, self.sigterm)
             signal.raise_signal(signal.SIGTERM)
         else:
             logger.error(f"Unknown signal {signum} received")
 
-    def write_trace(self, reenable: bool = True):
+    def write_trace(self, re_enable: bool = True):
         if self.trace_file:
             gds_api_stop_profiling(
                 f"{self.trace_file}.{self.trace_nr}.trace.json")
@@ -315,7 +315,7 @@ class WekaGdsBackend(StorageBackendInterface):
                 f"Trace written to {self.trace_file}.{self.trace_nr}.trace.json"
             )
             self.trace_nr += 1
-            if reenable:
+            if re_enable:
                 gds_api_start_profiling()
         else:
             logger.info("No trace file specified, not writing trace.")
@@ -682,7 +682,7 @@ class WekaGdsBackend(StorageBackendInterface):
         if not self.closed:
             self.closed = True
             if self.trace_file:
-                self.write_trace(reenable=False)
+                self.write_trace(re_enable=False)
             gds_api_cleanup()
             if self.stats:
                 logger.info("Stats collected:")
