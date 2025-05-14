@@ -452,8 +452,6 @@ class WekaGdsBackend(StorageBackendInterface):
                         memory_obj: MemoryObj) -> Optional[Future]:
         assert memory_obj.tensor is not None
 
-        self.memory_allocator.ref_count_up(memory_obj)
-
         with self.put_lock:
             self.put_tasks.add(key)
 
@@ -534,7 +532,6 @@ class WekaGdsBackend(StorageBackendInterface):
             metadata = save_gds(self.dst_device_pci, path, tmp, kv_chunk)
 
         self.insert_key(key, memory_obj)
-        self.memory_allocator.ref_count_down(memory_obj)
 
         task = asyncio.create_task(
             save_metadata(path + _METADATA_FILE_SUFFIX, tmp, metadata))
@@ -587,7 +584,6 @@ class WekaGdsBackend(StorageBackendInterface):
                 logger.error(
                     f"Error loading {path}: got only {ret} bytes out of {memory_obj.get_size()}, ignoring"
                 )
-            self.memory_allocator.ref_count_down(memory_obj)
             return None
 
         return memory_obj
@@ -631,7 +627,6 @@ class WekaGdsBackend(StorageBackendInterface):
                 logger.error(
                     f"Error loading {path}: got only {ret} bytes out of {memory_obj.get_size()}, ignoring"
                 )
-            self.memory_allocator.ref_count_down(memory_obj)
             return None
         return memory_obj
 
