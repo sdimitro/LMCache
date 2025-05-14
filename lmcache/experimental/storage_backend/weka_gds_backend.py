@@ -1,42 +1,32 @@
 import asyncio
-import aiofile
-from concurrent.futures import Future
-import datasketches
 import os
 import random
+import signal
 import string
 import struct
+import subprocess
 import threading
 import time
 from collections import OrderedDict
+from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Optional
-import signal
-import subprocess
 
+import aiofile
+import datasketches
 import torch
-
-from gds_client_api import (
-    gds_api_init,
-    gds_api_cleanup,
-    gds_api_write_to_gds,
-    gds_api_read_from_gds,
-    gds_api_start_profiling,
-    gds_api_stop_profiling,
-)
+from gds_client_api import (gds_api_cleanup, gds_api_init,
+                            gds_api_read_from_gds, gds_api_start_profiling,
+                            gds_api_stop_profiling, gds_api_write_to_gds)
 
 from lmcache.experimental.config import LMCacheEngineConfig
 from lmcache.experimental.memory_management import (MemoryAllocatorInterface,
                                                     MemoryObj)
-from lmcache.experimental.storage_backend.abstract_backend import StorageBackendInterface
+from lmcache.experimental.storage_backend.abstract_backend import \
+    StorageBackendInterface
 from lmcache.logging import init_logger
-from lmcache.utils import (
-    CacheEngineKey,
-    DiskCacheMetadata,
-    _lmcache_nvtx_annotate,
-    is_envvar_enabled,
-    timing,
-)
+from lmcache.utils import (CacheEngineKey, DiskCacheMetadata,
+                           _lmcache_nvtx_annotate, is_envvar_enabled, timing)
 
 _DEFAULT_TRACE_BUFFER_SIZE = 1024 * 1024
 _METADATA_FILE_SUFFIX = ".metadata"
@@ -84,9 +74,8 @@ def pack_metadata(shape, dtype, size) -> bytes:
     metadata_desc = "<QQQQ" + len(shape) * "Q"
     if struct.calcsize(metadata_desc) > metadata_max_size():
         # TODO(ilya): support variable offset for data
-        raise ValueError(
-            f"Metadata size {struct.calcsize(metadata_desc)} exceeds max size {metadata_max_size()}"
-        )
+        raise ValueError(f"Metadata size {struct.calcsize(metadata_desc)} "
+                         f"exceeds max size {metadata_max_size()}")
     return struct.pack(metadata_desc, _METADATA_VERSION, dtype_to_idx[dtype],
                        size, len(shape), *shape)
 
@@ -135,17 +124,20 @@ async def save_metadata(path: str, tmp: str, metadata: bytes):
 # TODO: find a better way, running an external command is an overkill,
 # the data is already there, just not accessible from Python...
 def get_dev_pci(device: str):
-    # TODO: this is dumb, but I don't see a way to get an index back from torch.device...
+    # TODO: this is dumb, but I don't see a way to get an index
+    # back from torch.device...
     parts = device.split(":")
     idx = parts[1] if len(parts) > 1 else "0"
     res = subprocess.run(
-        f"/usr/bin/nvidia-smi -i {idx} --query-gpu=pci.bus_id --format=csv,noheader",
+        f"/usr/bin/nvidia-smi -i {idx} --query-gpu=pci.bus_id "
+        "--format=csv,noheader",
         capture_output=True,
         text=True,
         check=True,
         shell=True)
     output = res.stdout.strip()
-    # TODO: for now drop the first part and convert to lower, to match what GDS implementation expects
+    # TODO: for now drop the first part and convert to lower,
+    # to match what GDS implementation expects
     pci_id = output.split(":", 1)[1].lower()
     logger.debug(f"Device PCI ID: {pci_id}")
     return pci_id
@@ -172,21 +164,21 @@ class GDSStats:
     total_put_b_write_time = 0
 
     def _print_times(self, name, td):
-        logger.info(
-            "{name} time (min/median/90pt/max), ms: {mn:.3f}/{med:.3f}/{pt90:.3f}/{mx:.3f}"
-            .format(name=name,
-                    mn=td.get_min_value() * 1000,
-                    med=td.get_quantile(0.5) * 1000,
-                    pt90=td.get_quantile(0.9) * 1000,
-                    mx=td.get_max_value() * 1000))
+        logger.info("{name} time (min/median/90pt/max), "
+                    "ms: {mn:.3f}/{med:.3f}/{pt90:.3f}/{mx:.3f}".format(
+                        name=name,
+                        mn=td.get_min_value() * 1000,
+                        med=td.get_quantile(0.5) * 1000,
+                        pt90=td.get_quantile(0.9) * 1000,
+                        mx=td.get_max_value() * 1000))
 
     def _print_throughput(self, name, size, acc):
         logger.info(f"{name} throughput: {size/1024/1024/acc} MB/s")
 
     def display(self):
-        logger.info(
-            f"Number of gets: {self.get_count}, total read size: {self.total_read_size/1024/1024} MB, total time spent in reads: {self.total_read_time} s"
-        )
+        logger.info(f"Number of gets: {self.get_count}, total read size: "
+                    f"{self.total_read_size/1024/1024} MB, total time spent "
+                    f"in reads: {self.total_read_time} s")
         if self.get_count:
             self._print_times("get", self.get_time)
             self._print_throughput("get", self.total_read_size,
@@ -195,9 +187,9 @@ class GDSStats:
             self._print_throughput("gds read", self.total_read_size,
                                    self.total_gds_read_time)
 
-        logger.info(
-            f"Number of puts: {self.put_b_count}, total write size: {self.total_put_b_size/1024/1024} MB, total time spent in writes: {self.total_put_b_time} s"
-        )
+        logger.info(f"Number of puts: {self.put_b_count}, total write size: "
+                    f"{self.total_put_b_size/1024/1024} MB, total time spent "
+                    f"in writes: {self.total_put_b_time} s")
         if self.put_b_count:
             self._print_times("put", self.put_b_time)
             self._print_throughput("put", self.total_put_b_size,
@@ -209,7 +201,8 @@ class GDSStats:
 
 class WekaGdsBackend(StorageBackendInterface):
     """
-    Cache engine for storing the KV cache of the tokens on Weka FS using GDS for reads and writes.
+    Cache engine for storing the KV cache of the tokens on
+    Weka FS using GDS for reads and writes.
     """
 
     def __init__(
@@ -244,12 +237,11 @@ class WekaGdsBackend(StorageBackendInterface):
                 try:
                     trace_buffer_size = int(trace_buffer_size_str)
                 except ValueError:
-                    logger.error(
-                        f"Invalid WEKA_GDS_TRACE_BUFFER_SIZE={trace_buffer_size_str}, using default value {trace_buffer_size}"
-                    )
-            logger.info(
-                f"Will save up to {trace_buffer_size} events to trace files with prefix {self.trace_file}"
-            )
+                    logger.error("Invalid WEKA_GDS_TRACE_BUFFER_SIZE="
+                                 f"{trace_buffer_size_str}, using "
+                                 f"default value {trace_buffer_size}")
+            logger.info(f"Will save up to {trace_buffer_size} events "
+                        f"to trace files with prefix {self.trace_file}")
             signal.signal(
                 signal.SIGUSR1,
                 lambda signum, frame: self.signal_handler(signum, frame))
@@ -349,23 +341,25 @@ class WekaGdsBackend(StorageBackendInterface):
                                     key = CacheEngineKey.from_string(key_str)
                                 except ValueError as e:
                                     logger.error(
-                                        f"Filename {filename} can't be converted back into cache key: {e}"
-                                    )
+                                        f"Filename {filename} can't be "
+                                        f"converted back into cache key: {e}")
                                     continue
-                                # TODO(ilya): think if we want to check the main file is still there.
-                                # Normally we only write metadata file _after_ the main file, but
-                                # what if it was removed?
+                                # TODO(ilya): think if we want to check the
+                                # main file is still there. Normally we only
+                                # write metadata file _after_ the main file,
+                                # but what if it was removed?
                                 try:
                                     self.read_metadata(key, fentry.path,
                                                        subdir + dirname)
                                 except UnsupportedMetadataVersion:
                                     logger.error(
-                                        f"Unsupported metadata version for {fentry.path}, ignoring"
-                                    )
+                                        "Unsupported metadata version "
+                                        f"for {fentry.path}, ignoring")
 
     async def scan_metadata(self):
-        # TODO(ilya): even though we only run it once on startup, this is still not super scalable,
-        # maybe we need to add metadata snapshotting later.
+        # TODO(ilya): even though we only run it once on startup,
+        # this is still not super scalable, maybe we need to add
+        # metadata snapshotting later.
         tasks = []
         start = time.perf_counter()
         with os.scandir(self.path) as it:
@@ -383,8 +377,8 @@ class WekaGdsBackend(StorageBackendInterface):
         await asyncio.gather(*tasks)
         end = time.perf_counter()
         logger.info(
-            f"Read {len(self.dict)} cache entries from persistent storage in {end - start:.2f} seconds"
-        )
+            f"Read {len(self.dict)} cache entries from persistent storage "
+            f"in {end - start:.2f} seconds")
 
     # TODO(serapheim): Handle pin semantics? (ilya)(Jiayi)
     def contains(
@@ -614,16 +608,15 @@ class WekaGdsBackend(StorageBackendInterface):
         if ret != memory_obj.get_size():
             if ret < 0:
                 logger.error(
-                    f"Error loading {path}: {ret}, was the entry GCed? Removing it from cache"
-                )
+                    f"Error loading {path}: {ret}, was the entry GCed? "
+                    "Removing it from cache")
                 with self.update_lock:
                     self.dict.pop(key)
             else:
-                # TODO(ilya): we should probably count errors and remove the entry
-                # if it's a persistent problem
-                logger.error(
-                    f"Error loading {path}: got only {ret} bytes out of {memory_obj.get_size()}, ignoring"
-                )
+                # TODO(ilya): we should probably count errors and
+                # remove the entry if it's a persistent problem
+                logger.error(f"Error loading {path}: got only {ret} bytes out "
+                             f"of {memory_obj.get_size()}, ignoring")
             return None
 
         return memory_obj
@@ -656,17 +649,15 @@ class WekaGdsBackend(StorageBackendInterface):
                            memory_obj.tensor.data_ptr(), memory_obj.get_size())
         if ret != memory_obj.get_size():
             if ret < 0:
-                logger.error(
-                    f"Error loading {path}: {ret}, was the entry GCed? Removing it from cache"
-                )
+                logger.error(f"Error loading {path}: {ret}, "
+                             f"was the entry GCed? Removing it from cache")
                 with self.update_lock:
                     self.dict.pop(key)
             else:
-                # TODO(ilya): we should probably count errors and remove the entry
-                # if it's a persistent problem
-                logger.error(
-                    f"Error loading {path}: got only {ret} bytes out of {memory_obj.get_size()}, ignoring"
-                )
+                # TODO(ilya): we should probably count errors and
+                # remove the entry if it's a persistent problem
+                logger.error(f"Error loading {path}: got only {ret} bytes "
+                             f"out of {memory_obj.get_size()}, ignoring")
             return None
         return memory_obj
 

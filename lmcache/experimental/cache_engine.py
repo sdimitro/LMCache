@@ -28,8 +28,8 @@ from lmcache.experimental.gpu_connector import (
 from lmcache.experimental.lookup_server import (LookupServerInterface,
                                                 RedisLookupServer)
 from lmcache.experimental.memory_management import (
-    AdHocMemoryAllocator, MemoryAllocatorInterface, MemoryFormat, MemoryObj,
-    MixedMemoryAllocator, GPUTemporaryMemoryAllocator)
+    AdHocMemoryAllocator, GPUTemporaryMemoryAllocator,
+    MemoryAllocatorInterface, MemoryFormat, MemoryObj, MixedMemoryAllocator)
 from lmcache.experimental.storage_backend.storage_manager import (
     DistributedStorageManager, StorageManager)
 from lmcache.experimental.token_database import (ChunkedTokenDatabase,
