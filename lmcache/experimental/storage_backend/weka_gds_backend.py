@@ -272,7 +272,7 @@ class WekaGdsBackend(StorageBackendInterface):
         if config.remote_url is None:
             raise ValueError("Expected config.remote_url to be set (got None)")
         self.path = config.remote_url[len("weka://"):]
-        self.subdirs = set()
+        self.subdirs: set[str] = set()
         self.rand = random.Random()
         self.rand.seed(self.dst_device_pci)
 
