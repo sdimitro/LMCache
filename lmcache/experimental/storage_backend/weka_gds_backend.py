@@ -386,9 +386,11 @@ class WekaGdsBackend(StorageBackendInterface):
             f"Read {len(self.dict)} cache entries from persistent storage in {end - start:.2f} seconds"
         )
 
+    # TODO(serapheim): Handle pin semantics? (ilya)(Jiayi)
     def contains(
         self,
         key: CacheEngineKey,
+        pin: bool = False,
     ) -> bool:
         """
         Check if the cache engine contains the key.
