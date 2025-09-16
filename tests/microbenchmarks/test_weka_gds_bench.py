@@ -6,10 +6,71 @@
 
 # Third Party
 import pytest
+import torch
 
 # Local
 from .benchmark_config import BenchmarkConfig
 from .benchmark_utils import BenchmarkRunner
+
+
+def validate_data_integrity(reference_data, retrieved_data, tolerance=1e-6):
+    """Validate that retrieved data matches reference data."""
+    assert len(reference_data) == len(retrieved_data), (
+        f"Length mismatch: {len(reference_data)} vs {len(retrieved_data)}"
+    )
+
+    mismatches = 0
+    for i, (ref, ret) in enumerate(zip(reference_data, retrieved_data, strict=False)):
+        if ref is None and ret is None:
+            continue
+        assert ref is not None and ret is not None, f"Null mismatch at index {i}"
+
+        # Convert retrieved data to CPU for comparison
+        if hasattr(ret, "tensor"):
+            ret_cpu = ret.tensor.detach().cpu()
+        else:
+            ret_cpu = ret.detach().cpu()
+
+        # Compare tensors with tolerance
+        if not torch.allclose(ref, ret_cpu, atol=tolerance, rtol=tolerance):
+            mismatches += 1
+            max_diff = torch.max(torch.abs(ref - ret_cpu)).item()
+            print(f"WARNING: Data mismatch at index {i}, max diff: {max_diff}")
+
+    if mismatches > 0:
+        raise AssertionError(
+            f"Data integrity check failed: {mismatches} mismatches found"
+        )
+
+    print(f"✅ Data integrity validated: {len(reference_data)} tensors match perfectly")
+
+
+def create_validating_wrapper(backend, reference_data, warmup_runs, benchmark_runs):
+    """Create a wrapper that captures final iteration data for validation."""
+    captured_data = [None]  # Use list to allow modification in nested function
+    total_runs = warmup_runs + benchmark_runs
+    current_run = [0]  # Use list for mutable counter
+
+    def batched_get_with_validation(keys_arg, backend_arg):
+        current_run[0] += 1
+        memory_objs = backend_arg.batched_get_blocking(keys_arg)
+
+        # Capture data from the final iteration for validation
+        if current_run[0] == total_runs and memory_objs:
+            captured_data[0] = [
+                obj.tensor.detach().cpu().clone() if obj is not None else None
+                for obj in memory_objs
+            ]
+
+        # Free memory objects as usual
+        if memory_objs:
+            for memory_obj in memory_objs:
+                if memory_obj is not None:
+                    memory_obj.ref_count_down()
+
+        return memory_objs
+
+    return batched_get_with_validation, captured_data
 
 
 @pytest.mark.benchmark
@@ -134,7 +195,9 @@ class TestWekaGdsBenchmarks:
         for batch_size in batch_sizes:
             print(f"\n--- Scaling test: batch size {batch_size} ---")
 
-            backend, keys = populated_backend(batch_size, tensor_shape, backend_config)
+            backend, keys, reference_data = populated_backend(
+                batch_size, tensor_shape, backend_config
+            )
 
             # Wrapper to free memory objects between iterations
             def batched_get_with_cleanup(keys_arg, backend_arg):
@@ -186,7 +249,8 @@ class TestWekaGdsBenchmarks:
             if result.batch_size >= 10:
                 min_efficiency = 1.5  # Should be at least 1.5x better than linear
                 assert efficiency >= min_efficiency, (
-                    f"Poor batching efficiency: {efficiency:.2f}x < {min_efficiency}x "
+                    f"Poor batching efficiency: {efficiency:.2f}x < "
+                    f"{min_efficiency}x "
                     f"for batch_size={result.batch_size}"
                 )
 
@@ -241,21 +305,21 @@ class TestWekaGdsBenchmarks:
                 f"shape={tensor_shape} ---"
             )
 
-            backend, keys = populated_backend(batch_size, tensor_shape, backend_config)
+            backend, keys, reference_data = populated_backend(
+                batch_size, tensor_shape, backend_config
+            )
 
-            # Wrapper to free memory objects between iterations
-            def batched_get_with_cleanup(keys_arg, backend_arg):
-                memory_objs = backend_arg.batched_get_blocking(keys_arg)
-                # Free the returned memory objects immediately after the call
-                if memory_objs:
-                    for memory_obj in memory_objs:
-                        if memory_obj is not None:
-                            memory_obj.ref_count_down()
-                return memory_objs
+            # Create validating wrapper for data integrity checking
+            validating_func, captured_data = create_validating_wrapper(
+                backend,
+                reference_data,
+                benchmark_config.warmup_runs,
+                benchmark_config.benchmark_runs,
+            )
 
             result = runner.run_benchmark(
                 function_name=f"batched_get_blocking_{config_name}",
-                func=batched_get_with_cleanup,
+                func=validating_func,
                 func_args=(keys, backend),
                 func_kwargs={},
                 batch_size=batch_size,
@@ -267,6 +331,13 @@ class TestWekaGdsBenchmarks:
 
             results.append(result)
             runner.print_summary(result)
+
+            # Validate data integrity for this configuration
+            if captured_data[0] is not None:
+                validate_data_integrity(reference_data, captured_data[0])
+                print(f"✅ Data integrity verified for {config_name}")
+            else:
+                print(f"WARNING: No validation data captured for {config_name}")
 
             # Explicit cleanup to free cuFile buffer before next test case
             try:
@@ -324,7 +395,9 @@ class TestWekaGdsBenchmarks:
         for batch_size in batch_sizes_to_test:
             print(f"\n--- Comparing single vs batched for {batch_size} items ---")
 
-            backend, keys = populated_backend(batch_size, tensor_shape, backend_config)
+            backend, keys, reference_data = populated_backend(
+                batch_size, tensor_shape, backend_config
+            )
 
             # Benchmark single get_blocking calls
             def single_gets_with_cleanup(keys_arg, backend_arg):
@@ -398,21 +471,19 @@ def test_quick_benchmark(populated_backend):
         "gds_io_threads": 32,
     }
 
-    backend, keys = populated_backend(batch_size, tensor_shape, backend_config)
+    backend, keys, reference_data = populated_backend(
+        batch_size, tensor_shape, backend_config
+    )
 
-    # Wrapper to free memory objects between iterations
-    def batched_get_with_cleanup(keys_arg, backend_arg):
-        memory_objs = backend_arg.batched_get_blocking(keys_arg)
-        if memory_objs:
-            for memory_obj in memory_objs:
-                if memory_obj is not None:
-                    memory_obj.ref_count_down()
-        return memory_objs
+    # Create validating wrapper that captures final iteration data
+    validating_func, captured_data = create_validating_wrapper(
+        backend, reference_data, warmup_runs=5, benchmark_runs=100
+    )
 
     runner = BenchmarkRunner("quick_test")
     result = runner.run_benchmark(
         function_name="batched_get_blocking_quick",
-        func=batched_get_with_cleanup,
+        func=validating_func,
         func_args=(keys, backend),
         func_kwargs={},
         batch_size=batch_size,
@@ -423,6 +494,12 @@ def test_quick_benchmark(populated_backend):
     )
 
     runner.print_summary(result)
+
+    # Validate data integrity
+    if captured_data[0] is not None:
+        validate_data_integrity(reference_data, captured_data[0])
+    else:
+        print("WARNING: No data captured for validation")
 
     # Basic sanity check
     assert result.mean_time > 0
