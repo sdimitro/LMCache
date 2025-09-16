@@ -57,7 +57,7 @@ Examples:
 
     # Custom options
     parser.add_argument(
-        "--runs", type=int, default=10, help="Number of benchmark runs (default: 10)"
+        "--runs", type=int, default=100, help="Number of benchmark runs (default: 100)"
     )
     parser.add_argument(
         "--warmup", type=int, default=3, help="Number of warmup runs (default: 3)"
