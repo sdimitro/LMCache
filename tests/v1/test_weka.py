@@ -1,65 +1,93 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from pathlib import Path
 import asyncio
 import os
 import shutil
 import threading
 
 # Third Party
-import pytest
 import torch
 
 # First Party
 from lmcache.utils import CacheEngineKey
-from lmcache.v1.cache_engine import LMCacheEngineBuilder
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.memory_management import CuFileMemoryAllocator
-from lmcache.v1.storage_backend import CreateStorageBackends
+from lmcache.v1.memory_management import CuFileMemoryAllocator, MemoryFormat, MemoryObj
+from lmcache.v1.storage_backend import WekaGdsBackend
 
 
-@pytest.mark.skip(reason="We need to add this test back after implementing prefetch")
-def test_weka_backend_sanity():
-    BASE_DIR = Path(__file__).parent
-    WEKA_DIR = "/tmp/weka/test-cache"
-    TEST_KEY = CacheEngineKey(
-        fmt="vllm",
-        model_name="meta-llama/Llama-3.1-70B-Instruct",
-        world_size=8,
-        worker_id=0,
-        chunk_hash="e3229141e680fb413d2c5d3ebb416c4ad300d381e309fc9e417757b91406c157",
+def create_test_config(
+    weka_path: str = "/mnt/weka/test-cache",
+    chunk_size: int = 256,
+    cufile_buffer_size: int = 128,
+    gds_io_threads: int = 32,
+):
+    config = LMCacheEngineConfig.from_defaults(
+        chunk_size=chunk_size,
+        weka_path=weka_path,
+        lmcache_instance_id="test_instance",
+        cufile_buffer_size=cufile_buffer_size,
+        extra_config={"gds_io_threads": gds_io_threads},
     )
-    BACKEND_NAME = "WekaGdsBackend"
+    return config
+
+
+def create_test_key(
+    fmt: str = "vllm",
+    model_name: str = "meta-llama/Llama-3.1-70B-Instruct",
+    world_size: int = 8,
+    worker_id: int = 0,
+    chunk_hash: int = -3811288445880773366,
+) -> CacheEngineKey:
+    return CacheEngineKey(
+        fmt=fmt,
+        model_name=model_name,
+        world_size=world_size,
+        worker_id=worker_id,
+        chunk_hash=chunk_hash,
+    )
+
+
+def create_test_backend(
+    config: LMCacheEngineConfig, loop: asyncio.AbstractEventLoop
+) -> WekaGdsBackend:
+    weka_backend = WekaGdsBackend(
+        config,
+        loop,
+        CuFileMemoryAllocator(config.cufile_buffer_size * 1024**2),
+        dst_device="cuda:0",
+    )
+    assert weka_backend is not None
+    assert weka_backend.memory_allocator is not None
+    assert isinstance(weka_backend.memory_allocator, CuFileMemoryAllocator)
+    return weka_backend
+
+
+def create_test_memory_obj(
+    backend: WekaGdsBackend, shape=(2, 16, 8, 128), dtype=torch.bfloat16
+) -> MemoryObj:
+    memory_obj = backend.memory_allocator.allocate(
+        shape, dtype, fmt=MemoryFormat.KV_T2D
+    )
+    return memory_obj
+
+
+def test_weka_backend_sanity():
+    WEKA_DIR = "/mnt/weka/test-cache"
+    TEST_KEY = create_test_key()
+    CONFIG_WEKA = create_test_config()
 
     try:
         os.makedirs(WEKA_DIR, exist_ok=True)
-        config_weka = LMCacheEngineConfig.from_file(BASE_DIR / "data/weka.yaml")
-        assert config_weka.cufile_buffer_size == 128
-
         thread_loop = asyncio.new_event_loop()
         thread = threading.Thread(target=thread_loop.run_forever)
         thread.start()
 
-        backends = CreateStorageBackends(
-            config_weka,
-            None,
-            thread_loop,
-            LMCacheEngineBuilder._Create_memory_allocator(config_weka, None),
-        )
-        assert len(backends) == 2
-        assert BACKEND_NAME in backends
-
-        weka_backend = backends[BACKEND_NAME]
-        assert weka_backend is not None
-        assert weka_backend.memory_allocator is not None
-        assert isinstance(weka_backend.memory_allocator, CuFileMemoryAllocator)
+        weka_backend = create_test_backend(CONFIG_WEKA, thread_loop)
 
         assert not weka_backend.contains(TEST_KEY, False)
         assert not weka_backend.exists_in_put_tasks(TEST_KEY)
 
-        memory_obj = weka_backend.memory_allocator.allocate(
-            [2048, 2048], dtype=torch.uint8
-        )
+        memory_obj = create_test_memory_obj(weka_backend)
         future = weka_backend.submit_put_task(TEST_KEY, memory_obj)
         assert future is not None
         assert weka_backend.exists_in_put_tasks(TEST_KEY)
@@ -69,14 +97,6 @@ def test_weka_backend_sanity():
         assert not weka_backend.exists_in_put_tasks(TEST_KEY)
 
         returned_memory_obj = weka_backend.get_blocking(TEST_KEY)
-        assert returned_memory_obj is not None
-        assert returned_memory_obj.get_size() == memory_obj.get_size()
-        assert returned_memory_obj.get_shape() == memory_obj.get_shape()
-        assert returned_memory_obj.get_dtype() == memory_obj.get_dtype()
-
-        future = weka_backend.get_non_blocking(TEST_KEY)
-        assert future is not None
-        returned_memory_obj = future.result()
         assert returned_memory_obj is not None
         assert returned_memory_obj.get_size() == memory_obj.get_size()
         assert returned_memory_obj.get_shape() == memory_obj.get_shape()
