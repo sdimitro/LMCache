@@ -390,8 +390,8 @@ class TestWekaGdsBenchmarks:
 def test_quick_benchmark(populated_backend):
     """Quick benchmark for development/debugging."""
 
-    batch_size = 256
-    tensor_shape = (2, 16, 32, 128)
+    batch_size = 512
+    tensor_shape = (2, 128, 128, 128)
     backend_config = {
         "chunk_size": 256,
         "cufile_buffer_size": 8192,
@@ -418,13 +418,13 @@ def test_quick_benchmark(populated_backend):
         batch_size=batch_size,
         tensor_shape=tensor_shape,
         backend_config=backend_config,
-        warmup_runs=1,
-        benchmark_runs=10,
+        warmup_runs=5,
+        benchmark_runs=100,
     )
 
     runner.print_summary(result)
 
     # Basic sanity check
     assert result.mean_time > 0
-    assert result.mean_time < 10.0  # Should not take more than 10 seconds
-    assert len(result.raw_times) == 10
+    assert result.mean_time < 0.250  # Should not take more than 0.250 seconds
+    assert len(result.raw_times) == 100
