@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Microbenchmarks for WekaGDS backend functions."""
 
+# Standard
+# Standard Library
+
 # Third Party
 import pytest
 
@@ -117,14 +120,21 @@ class TestWekaGdsBenchmarks:
         for batch_size in batch_sizes:
             print(f"\n--- Scaling test: batch size {batch_size} ---")
 
-            backend, keys, memory_objs = populated_backend(
-                batch_size, tensor_shape, backend_config
-            )
+            backend, keys = populated_backend(batch_size, tensor_shape, backend_config)
+
+            # Wrapper to free memory objects between iterations
+            def batched_get_with_cleanup(keys_arg, backend_arg):
+                memory_objs = backend_arg.batched_get_blocking(keys_arg)
+                if memory_objs:
+                    for memory_obj in memory_objs:
+                        if memory_obj is not None:
+                            memory_obj.ref_count_down()
+                return memory_objs
 
             result = runner.run_benchmark(
                 function_name="batched_get_blocking_scaling",
-                func=backend.batched_get_blocking,
-                func_args=(keys,),
+                func=batched_get_with_cleanup,
+                func_args=(keys, backend),
                 func_kwargs={},
                 batch_size=batch_size,
                 tensor_shape=tensor_shape,
@@ -186,28 +196,28 @@ class TestWekaGdsBenchmarks:
         test_cases = [
             # (batch_size, tensor_shape, backend_config_name, backend_config)
             (
-                10,
+                512,
                 (2, 16, 8, 128),
                 "small_config",
-                {"chunk_size": 256, "cufile_buffer_size": 128, "gds_io_threads": 16},
+                {"chunk_size": 256, "cufile_buffer_size": 8192, "gds_io_threads": 32},
             ),
             (
-                10,
+                512,
                 (2, 32, 16, 128),
                 "medium_config",
-                {"chunk_size": 512, "cufile_buffer_size": 256, "gds_io_threads": 32},
+                {"chunk_size": 256, "cufile_buffer_size": 8192, "gds_io_threads": 32},
             ),
             (
-                20,
-                (2, 16, 8, 128),
-                "high_threads",
-                {"chunk_size": 256, "cufile_buffer_size": 128, "gds_io_threads": 64},
+                512,
+                (2, 32, 32, 128),
+                "large_config",
+                {"chunk_size": 256, "cufile_buffer_size": 8192, "gds_io_threads": 32},
             ),
             (
-                20,
-                (2, 32, 16, 128),
-                "large_buffer",
-                {"chunk_size": 256, "cufile_buffer_size": 512, "gds_io_threads": 32},
+                512,
+                (2, 128, 128, 128),
+                "vllm_sample_buffer",
+                {"chunk_size": 256, "cufile_buffer_size": 8192, "gds_io_threads": 32},
             ),
         ]
 
@@ -217,14 +227,22 @@ class TestWekaGdsBenchmarks:
                 f"shape={tensor_shape} ---"
             )
 
-            backend, keys, memory_objs = populated_backend(
-                batch_size, tensor_shape, backend_config
-            )
+            backend, keys = populated_backend(batch_size, tensor_shape, backend_config)
+
+            # Wrapper to free memory objects between iterations
+            def batched_get_with_cleanup(keys_arg, backend_arg):
+                memory_objs = backend_arg.batched_get_blocking(keys_arg)
+                # Free the returned memory objects immediately after the call
+                if memory_objs:
+                    for memory_obj in memory_objs:
+                        if memory_obj is not None:
+                            memory_obj.ref_count_down()
+                return memory_objs
 
             result = runner.run_benchmark(
                 function_name=f"batched_get_blocking_{config_name}",
-                func=backend.batched_get_blocking,
-                func_args=(keys,),
+                func=batched_get_with_cleanup,
+                func_args=(keys, backend),
                 func_kwargs={},
                 batch_size=batch_size,
                 tensor_shape=tensor_shape,
@@ -235,6 +253,15 @@ class TestWekaGdsBenchmarks:
 
             results.append(result)
             runner.print_summary(result)
+
+            # Explicit cleanup to free cuFile buffer before next test case
+            try:
+                backend.close()
+                # Also explicitly close the memory allocator
+                if hasattr(backend, "memory_allocator"):
+                    backend.memory_allocator.close()
+            except Exception:
+                pass
 
         # Save comprehensive results
         if benchmark_config.save_results:
@@ -283,21 +310,23 @@ class TestWekaGdsBenchmarks:
         for batch_size in batch_sizes_to_test:
             print(f"\n--- Comparing single vs batched for {batch_size} items ---")
 
-            backend, keys, memory_objs = populated_backend(
-                batch_size, tensor_shape, backend_config
-            )
+            backend, keys = populated_backend(batch_size, tensor_shape, backend_config)
 
             # Benchmark single get_blocking calls
-            def single_gets(keys_arg, backend_arg):
+            def single_gets_with_cleanup(keys_arg, backend_arg):
                 results = []
                 for key in keys_arg:
                     result = backend_arg.get_blocking(key)
                     results.append(result)
+                # Free the returned memory objects immediately
+                for result in results:
+                    if result is not None:
+                        result.ref_count_down()
                 return results
 
             single_result = runner.run_benchmark(
                 function_name="single_get_blocking",
-                func=single_gets,
+                func=single_gets_with_cleanup,
                 func_args=(keys, backend),
                 func_kwargs={},
                 batch_size=batch_size,
@@ -308,10 +337,18 @@ class TestWekaGdsBenchmarks:
             )
 
             # Benchmark batched get_blocking
+            def batched_get_with_cleanup(keys_arg, backend_arg):
+                memory_objs = backend_arg.batched_get_blocking(keys_arg)
+                if memory_objs:
+                    for memory_obj in memory_objs:
+                        if memory_obj is not None:
+                            memory_obj.ref_count_down()
+                return memory_objs
+
             batched_result = runner.run_benchmark(
                 function_name="batched_get_blocking",
-                func=backend.batched_get_blocking,
-                func_args=(keys,),
+                func=batched_get_with_cleanup,
+                func_args=(keys, backend),
                 func_kwargs={},
                 batch_size=batch_size,
                 tensor_shape=tensor_shape,
@@ -339,29 +376,36 @@ class TestWekaGdsBenchmarks:
 def test_quick_benchmark(populated_backend):
     """Quick benchmark for development/debugging."""
 
-    batch_size = 5
-    tensor_shape = (2, 16, 8, 128)
+    batch_size = 256
+    tensor_shape = (2, 16, 32, 128)
     backend_config = {
         "chunk_size": 256,
-        "cufile_buffer_size": 128,
+        "cufile_buffer_size": 8192,
         "gds_io_threads": 32,
     }
 
-    backend, keys, memory_objs = populated_backend(
-        batch_size, tensor_shape, backend_config
-    )
+    backend, keys = populated_backend(batch_size, tensor_shape, backend_config)
+
+    # Wrapper to free memory objects between iterations
+    def batched_get_with_cleanup(keys_arg, backend_arg):
+        memory_objs = backend_arg.batched_get_blocking(keys_arg)
+        if memory_objs:
+            for memory_obj in memory_objs:
+                if memory_obj is not None:
+                    memory_obj.ref_count_down()
+        return memory_objs
 
     runner = BenchmarkRunner("quick_test")
     result = runner.run_benchmark(
         function_name="batched_get_blocking_quick",
-        func=backend.batched_get_blocking,
-        func_args=(keys,),
+        func=batched_get_with_cleanup,
+        func_args=(keys, backend),
         func_kwargs={},
         batch_size=batch_size,
         tensor_shape=tensor_shape,
         backend_config=backend_config,
         warmup_runs=1,
-        benchmark_runs=3,
+        benchmark_runs=10,
     )
 
     runner.print_summary(result)
@@ -369,4 +413,4 @@ def test_quick_benchmark(populated_backend):
     # Basic sanity check
     assert result.mean_time > 0
     assert result.mean_time < 10.0  # Should not take more than 10 seconds
-    assert len(result.raw_times) == 3
+    assert len(result.raw_times) == 10

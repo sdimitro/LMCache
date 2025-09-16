@@ -117,7 +117,11 @@ def test_config_factory():
 @pytest.fixture
 def weka_backend_factory(test_config_factory, async_thread, weka_test_dir):
     """Factory for creating WekaGDS backends with different configurations."""
-    backends = []
+    # Use WeakSet to avoid keeping strong references that prevent GC
+    # Standard
+    import weakref
+
+    backend_refs = weakref.WeakSet()
 
     def _create_backend(
         chunk_size: int = 256,
@@ -137,7 +141,7 @@ def weka_backend_factory(test_config_factory, async_thread, weka_test_dir):
             CuFileMemoryAllocator(config.cufile_buffer_size * 1024**2),
             dst_device="cuda:0",
         )
-        backends.append(backend)
+        backend_refs.add(backend)  # Weak reference won't prevent GC
         return backend
 
     # Ensure test directory exists
@@ -145,8 +149,8 @@ def weka_backend_factory(test_config_factory, async_thread, weka_test_dir):
 
     yield _create_backend
 
-    # Cleanup
-    for backend in backends:
+    # Cleanup any remaining backends (weak references may have been GC'd)
+    for backend in list(backend_refs):  # Copy to avoid iteration issues
         try:
             backend.close()
         except Exception:
@@ -237,7 +241,7 @@ def populated_backend(weka_backend_factory, test_data_generator):
         batch_size: int,
         tensor_shape: tuple = (2, 16, 8, 128),
         backend_config: dict = None,
-    ) -> tuple[WekaGdsBackend, List[CacheEngineKey], List[MemoryObj]]:
+    ) -> tuple[WekaGdsBackend, List[CacheEngineKey]]:
         if backend_config is None:
             backend_config = {}
 
@@ -253,7 +257,15 @@ def populated_backend(weka_backend_factory, test_data_generator):
         for key in keys:
             assert backend.contains(key), f"Key {key} not found in backend"
 
-        return backend, keys, memory_objs
+        # Free original memory objects - we don't need them after storage
+        for memory_obj in memory_objs:
+            if memory_obj is not None:
+                memory_obj.ref_count_down()
+
+        # Clear the list to help GC
+        memory_objs.clear()
+
+        return backend, keys
 
     return _create_populated_backend
 
