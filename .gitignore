@@ -120,3 +120,5 @@ lmcache/experimental/tests
 
 # Ignore all log files
 *.log
+
+uv.lock
