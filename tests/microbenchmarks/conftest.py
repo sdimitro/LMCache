@@ -241,12 +241,22 @@ def populated_backend(weka_backend_factory, test_data_generator):
         batch_size: int,
         tensor_shape: tuple = (2, 16, 8, 128),
         backend_config: dict = None,
-    ) -> tuple[WekaGdsBackend, List[CacheEngineKey]]:
+    ) -> tuple[WekaGdsBackend, List[CacheEngineKey], List[torch.Tensor]]:
         if backend_config is None:
             backend_config = {}
 
         backend = weka_backend_factory(**backend_config)
         keys, memory_objs = test_data_generator(backend, batch_size, tensor_shape)
+
+        # Create CPU reference copies for data integrity verification
+        reference_data = []
+        for memory_obj in memory_objs:
+            if memory_obj is not None and memory_obj.tensor is not None:
+                # Copy GPU tensor to CPU for reference
+                cpu_copy = memory_obj.tensor.detach().cpu().clone()
+                reference_data.append(cpu_copy)
+            else:
+                reference_data.append(None)
 
         # Store all data in the backend
         futures = backend.batched_submit_put_task(keys, memory_objs)
@@ -265,7 +275,7 @@ def populated_backend(weka_backend_factory, test_data_generator):
         # Clear the list to help GC
         memory_objs.clear()
 
-        return backend, keys
+        return backend, keys, reference_data
 
     return _create_populated_backend
 
