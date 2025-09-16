@@ -165,3 +165,175 @@ def basic_batch_store_load_test(backend: WekaGdsBackend):
 
 def test_weka_backend_batch_store_load():
     init_and_teardown(basic_batch_store_load_test)
+
+
+def submit_put_task_cufile_write_failure_test(backend: WekaGdsBackend):
+    """Test that submit_put_task handles cuFile write failures gracefully"""
+    # Standard
+    import unittest.mock
+
+    k = create_test_key()
+    memory_obj = create_test_memory_obj(backend)
+
+    # Mock cuFile.CuFile to raise an exception during write
+    with unittest.mock.patch.object(backend.cufile, "CuFile") as mock_cufile:
+        mock_file = unittest.mock.MagicMock()
+        mock_file.write.side_effect = RuntimeError("CuFile write failed")
+        mock_cufile.return_value.__enter__ = unittest.mock.MagicMock(
+            return_value=mock_file
+        )
+        mock_cufile.return_value.__exit__ = unittest.mock.MagicMock(return_value=None)
+
+        # Submit the put task
+        future = backend.submit_put_task(k, memory_obj)
+        assert future is not None
+        assert backend.exists_in_put_tasks(k)
+
+        # The future should complete with an exception
+        try:
+            future.result()
+            raise AssertionError("Expected an exception but none was raised")
+        except RuntimeError as e:
+            assert "CuFile write failed" in str(e)
+
+        # Verify the key is removed from put_tasks even after failure
+        assert not backend.exists_in_put_tasks(k)
+        # Key should not be in cache since the operation failed
+        assert not backend.contains(k, False)
+
+
+def test_weka_backend_submit_put_task_cufile_write_failure():
+    init_and_teardown(submit_put_task_cufile_write_failure_test)
+
+
+def submit_put_task_posix_metadata_write_failure_test(backend: WekaGdsBackend):
+    """Test that submit_put_task handles POSIX metadata write failures gracefully"""
+    # Standard
+    import unittest.mock
+
+    k = create_test_key()
+    memory_obj = create_test_memory_obj(backend)
+
+    # Mock the built-in open function to raise an exception when writing metadata
+    with unittest.mock.patch("builtins.open") as mock_open:
+        mock_open.side_effect = IOError("POSIX metadata write failed")
+
+        # Submit the put task
+        future = backend.submit_put_task(k, memory_obj)
+        assert future is not None
+        assert backend.exists_in_put_tasks(k)
+
+        # The future should complete with an exception
+        try:
+            future.result()
+            raise AssertionError("Expected an exception but none was raised")
+        except IOError as e:
+            assert "POSIX metadata write failed" in str(e)
+
+        # Verify the key is removed from put_tasks even after failure
+        assert not backend.exists_in_put_tasks(k)
+        # Key should not be in cache since the operation failed
+        assert not backend.contains(k, False)
+
+
+def test_weka_backend_submit_put_task_posix_metadata_write_failure():
+    init_and_teardown(submit_put_task_posix_metadata_write_failure_test)
+
+
+def get_blocking_cufile_read_failure_test(backend: WekaGdsBackend):
+    """Test that get_blocking handles cuFile read failures gracefully"""
+    # Standard
+    import unittest.mock
+
+    # First, successfully store an object
+    k = create_test_key()
+    memory_obj = create_test_memory_obj(backend)
+    future = backend.submit_put_task(k, memory_obj)
+    future.result()
+    assert backend.contains(k, False)
+
+    # Now mock cuFile.CuFile to fail during read
+    with unittest.mock.patch.object(backend.cufile, "CuFile") as mock_cufile:
+        mock_file = unittest.mock.MagicMock()
+        mock_file.read.side_effect = RuntimeError("CuFile read failed")
+        mock_cufile.return_value.__enter__ = unittest.mock.MagicMock(
+            return_value=mock_file
+        )
+        mock_cufile.return_value.__exit__ = unittest.mock.MagicMock(return_value=None)
+
+        # Try to get the object - should handle the error gracefully
+        returned_memory_obj = backend.get_blocking(k)
+        # Should return None on read failure
+        assert returned_memory_obj is None
+
+
+def test_weka_backend_get_blocking_cufile_read_failure():
+    init_and_teardown(get_blocking_cufile_read_failure_test)
+
+
+def get_blocking_cufile_partial_read_test(backend: WekaGdsBackend):
+    """Test that get_blocking handles partial reads gracefully"""
+    # Standard
+    import unittest.mock
+
+    # First, successfully store an object
+    k = create_test_key()
+    memory_obj = create_test_memory_obj(backend)
+    future = backend.submit_put_task(k, memory_obj)
+    future.result()
+    assert backend.contains(k, False)
+
+    expected_size = memory_obj.get_physical_size()
+
+    # Mock cuFile.CuFile to return partial read
+    with unittest.mock.patch.object(backend.cufile, "CuFile") as mock_cufile:
+        mock_file = unittest.mock.MagicMock()
+        # Return less bytes than expected
+        mock_file.read.return_value = expected_size // 2
+        mock_cufile.return_value.__enter__ = unittest.mock.MagicMock(
+            return_value=mock_file
+        )
+        mock_cufile.return_value.__exit__ = unittest.mock.MagicMock(return_value=None)
+
+        # Try to get the object - should handle the partial read gracefully
+        returned_memory_obj = backend.get_blocking(k)
+        # Should return None on partial read
+        assert returned_memory_obj is None
+
+
+def test_weka_backend_get_blocking_cufile_partial_read():
+    init_and_teardown(get_blocking_cufile_partial_read_test)
+
+
+def get_blocking_cufile_negative_return_test(backend: WekaGdsBackend):
+    """Test that get_blocking handles negative cuFile read returns gracefully"""
+    # Standard
+    import unittest.mock
+
+    # First, successfully store an object
+    k = create_test_key()
+    memory_obj = create_test_memory_obj(backend)
+    future = backend.submit_put_task(k, memory_obj)
+    future.result()
+    assert backend.contains(k, False)
+
+    # Mock cuFile.CuFile to return negative value (error)
+    with unittest.mock.patch.object(backend.cufile, "CuFile") as mock_cufile:
+        mock_file = unittest.mock.MagicMock()
+        # Return negative value indicating error
+        mock_file.read.return_value = -1
+        mock_cufile.return_value.__enter__ = unittest.mock.MagicMock(
+            return_value=mock_file
+        )
+        mock_cufile.return_value.__exit__ = unittest.mock.MagicMock(return_value=None)
+
+        # Try to get the object - should handle the error gracefully
+        returned_memory_obj = backend.get_blocking(k)
+        # Should return None on error
+        assert returned_memory_obj is None
+        # Key should be removed from cache after error
+        assert not backend.contains(k, False)
+
+
+def test_weka_backend_get_blocking_cufile_negative_return():
+    init_and_teardown(get_blocking_cufile_negative_return_test)
