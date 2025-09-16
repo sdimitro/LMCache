@@ -71,36 +71,16 @@ def create_test_memory_obj(
     return memory_obj
 
 
-def test_weka_backend_sanity():
+def init_and_teardown(test_func):
     WEKA_DIR = "/mnt/weka/test-cache"
-    TEST_KEY = create_test_key()
-    CONFIG_WEKA = create_test_config()
-
     try:
         os.makedirs(WEKA_DIR, exist_ok=True)
         thread_loop = asyncio.new_event_loop()
         thread = threading.Thread(target=thread_loop.run_forever)
         thread.start()
 
-        weka_backend = create_test_backend(CONFIG_WEKA, thread_loop)
-
-        assert not weka_backend.contains(TEST_KEY, False)
-        assert not weka_backend.exists_in_put_tasks(TEST_KEY)
-
-        memory_obj = create_test_memory_obj(weka_backend)
-        future = weka_backend.submit_put_task(TEST_KEY, memory_obj)
-        assert future is not None
-        assert weka_backend.exists_in_put_tasks(TEST_KEY)
-        assert not weka_backend.contains(TEST_KEY, False)
-        future.result()
-        assert weka_backend.contains(TEST_KEY, False)
-        assert not weka_backend.exists_in_put_tasks(TEST_KEY)
-
-        returned_memory_obj = weka_backend.get_blocking(TEST_KEY)
-        assert returned_memory_obj is not None
-        assert returned_memory_obj.get_size() == memory_obj.get_size()
-        assert returned_memory_obj.get_shape() == memory_obj.get_shape()
-        assert returned_memory_obj.get_dtype() == memory_obj.get_dtype()
+        weka_backend = create_test_backend(create_test_config(), thread_loop)
+        test_func(weka_backend)
     finally:
         if thread_loop.is_running():
             thread_loop.call_soon_threadsafe(thread_loop.stop)
@@ -114,3 +94,74 @@ def test_weka_backend_sanity():
         # don't make each other fail.
         if os.path.exists(WEKA_DIR):
             shutil.rmtree(WEKA_DIR)
+
+
+def basic_store_load_test(backend: WekaGdsBackend):
+    k = create_test_key()
+    assert not backend.contains(k, False)
+    assert not backend.exists_in_put_tasks(k)
+
+    memory_obj = create_test_memory_obj(backend)
+    future = backend.submit_put_task(k, memory_obj)
+    assert future is not None
+    assert backend.exists_in_put_tasks(k)
+    assert not backend.contains(k, False)
+    future.result()
+    assert backend.contains(k, False)
+    assert not backend.exists_in_put_tasks(k)
+
+    returned_memory_obj = backend.get_blocking(k)
+    assert returned_memory_obj is not None
+    assert returned_memory_obj.get_size() == memory_obj.get_size()
+    assert returned_memory_obj.get_shape() == memory_obj.get_shape()
+    assert returned_memory_obj.get_dtype() == memory_obj.get_dtype()
+
+    k_does_not_exist = create_test_key(chunk_hash=0xDEADBEEF)
+    assert not backend.contains(k_does_not_exist, False)
+    assert not backend.exists_in_put_tasks(k_does_not_exist)
+    returned_memory_obj = backend.get_blocking(k_does_not_exist)
+    assert returned_memory_obj is None
+
+
+def test_weka_backend_sanity():
+    init_and_teardown(basic_store_load_test)
+
+
+def basic_batch_store_load_test(backend: WekaGdsBackend):
+    keys = []
+    for chunk_hash in [0xDEADBEEF, 0xCAFEBABE, 0xBADB0E]:
+        keys.append(create_test_key(chunk_hash=chunk_hash))
+    memory_objs = [create_test_memory_obj(backend) for _ in range(len(keys))]
+    futures = backend.batched_submit_put_task(keys, memory_objs)
+    assert futures is not None
+    assert len(futures) == 3
+    for future in futures:
+        assert future is not None
+        future.result()
+    for key in keys:
+        assert backend.contains(key)
+
+    returned_memory_objs = backend.batched_get_blocking(keys)
+    assert returned_memory_objs is not None
+    assert len(returned_memory_objs) == len(keys)
+    for returned_memory_obj, memory_obj in zip(
+        returned_memory_objs, memory_objs, strict=True
+    ):
+        assert returned_memory_obj is not None
+        assert returned_memory_obj.get_size() == memory_obj.get_size()
+        assert returned_memory_obj.get_shape() == memory_obj.get_shape()
+        assert returned_memory_obj.get_dtype() == memory_obj.get_dtype()
+
+    k_does_not_exist = create_test_key(chunk_hash=0xDEADB0E)
+    assert not backend.contains(k_does_not_exist, False)
+    assert not backend.exists_in_put_tasks(k_does_not_exist)
+    returned_memory_objs = backend.batched_get_blocking([k_does_not_exist])
+    assert returned_memory_objs is not None
+    assert len(returned_memory_objs) == 1
+    assert returned_memory_objs[0] is None
+    assert not backend.exists_in_put_tasks(k_does_not_exist)
+    assert not backend.contains(k_does_not_exist, False)
+
+
+def test_weka_backend_batch_store_load():
+    init_and_teardown(basic_batch_store_load_test)
