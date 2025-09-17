@@ -403,6 +403,10 @@ def contains_timeout_test(backend: WekaGdsBackend):
         assert result is False
 
 
+def test_contains_timeout():
+    init_and_teardown(contains_timeout_test)
+
+
 def get_blocking_timeout_test(backend: WekaGdsBackend):
     """Test that get_blocking() handles operation timeout gracefully"""
     k = create_test_key()
@@ -428,6 +432,10 @@ def get_blocking_timeout_test(backend: WekaGdsBackend):
         # This should not crash, but should return None and log timeout error
         result = backend.get_blocking(k)
         assert result is None
+
+
+def test_get_blocking_timeout():
+    init_and_teardown(get_blocking_timeout_test)
 
 
 def batched_get_blocking_timeout_test(backend: WekaGdsBackend):
@@ -456,6 +464,10 @@ def batched_get_blocking_timeout_test(backend: WekaGdsBackend):
         # This should not crash, but should return [None, None] and log timeout error
         result = backend.batched_get_blocking([k1, k2])
         assert result == [None, None]
+
+
+def test_batched_get_blocking_timeout():
+    init_and_teardown(batched_get_blocking_timeout_test)
 
 
 def contains_hang_threshold_test(backend: WekaGdsBackend):
@@ -493,6 +505,10 @@ def contains_hang_threshold_test(backend: WekaGdsBackend):
         result = backend.contains(k, False)
         # Should still return False, but due to hang threshold
         assert result is False
+
+
+def test_contains_hang_threshold():
+    init_and_teardown(contains_hang_threshold_test)
 
 
 def get_blocking_hang_threshold_test(backend: WekaGdsBackend):
@@ -539,6 +555,10 @@ def get_blocking_hang_threshold_test(backend: WekaGdsBackend):
         result = backend.get_blocking(k)
         # Should still return None, but due to hang threshold
         assert result is None
+
+
+def test_get_blocking_hang_threshold():
+    init_and_teardown(get_blocking_hang_threshold_test)
 
 
 def batched_get_blocking_hang_threshold_test(backend: WekaGdsBackend):
@@ -599,25 +619,97 @@ def batched_get_blocking_hang_threshold_test(backend: WekaGdsBackend):
         ]
 
 
-def test_contains_timeout():
-    init_and_teardown(contains_timeout_test)
-
-
-def test_get_blocking_timeout():
-    init_and_teardown(get_blocking_timeout_test)
-
-
-def test_batched_get_blocking_timeout():
-    init_and_teardown(batched_get_blocking_timeout_test)
-
-
-def test_contains_hang_threshold():
-    init_and_teardown(contains_hang_threshold_test)
-
-
-def test_get_blocking_hang_threshold():
-    init_and_teardown(get_blocking_hang_threshold_test)
-
-
 def test_batched_get_blocking_hang_threshold():
     init_and_teardown(batched_get_blocking_hang_threshold_test)
+
+
+def cross_operation_hang_threshold_test(backend: WekaGdsBackend):
+    """Test that hitting hang threshold for one operation affects all operations"""
+    # Set up test keys and data
+    k1 = create_test_key(chunk_hash=11111111)
+    k2 = create_test_key(chunk_hash=22222222)
+    k3 = create_test_key(chunk_hash=33333333)
+
+    memory_obj1 = create_test_memory_obj(backend)
+    memory_obj2 = create_test_memory_obj(backend)
+
+    # Put items in cache for get operations
+    future1 = backend.submit_put_task(k1, memory_obj1)
+    future2 = backend.submit_put_task(k2, memory_obj2)
+    future1.result()
+    future2.result()
+
+    def slow_load_bytes_from_disk(key, path, dtype, shape):
+        """Mock function that always times out"""
+        time.sleep(backend.timeout_get_blocking + 1.0)
+        return None
+
+    def slow_try_to_read_metadata(key):
+        """Mock function that always times out"""
+        time.sleep(backend.timeout_contains + 1.0)
+        return None
+
+    def slow_batched_get_blocking(keys):
+        """Mock function that always times out"""
+        time.sleep(backend.timeout_batched_get_blocking + 1.0)
+        return [None] * len(keys)
+
+    # Reset timeout counter first
+    backend.op_manager.reset_timeout_count()
+
+    # First, use get_blocking to hit the hang threshold
+    with unittest.mock.patch.object(
+        backend,
+        "_load_bytes_from_disk_with_allocation",
+        side_effect=slow_load_bytes_from_disk,
+    ):
+        # Trigger timeouts with get_blocking to reach the hang threshold
+        for i in range(backend.op_manager._hang_threshold):
+            test_key = create_test_key(chunk_hash=1000 + i)
+            # Put each test key in cache first
+            test_memory_obj = create_test_memory_obj(backend)
+            test_future = backend.submit_put_task(test_key, test_memory_obj)
+            test_future.result()
+
+            result = backend.get_blocking(test_key)
+            assert result is None
+
+        # Verify we've reached the timeout count
+        assert (
+            backend.op_manager.get_timeout_count() >= backend.op_manager._hang_threshold
+        )
+
+    # Now test that ALL operations fail due to shared hang threshold
+    # Clear hot cache for contains test
+    with backend.hot_lock:
+        backend.hot_cache.clear()
+
+    # Test contains() - should fail due to hang threshold reached by get_blocking
+    with unittest.mock.patch.object(
+        backend, "_try_to_read_metadata", side_effect=slow_try_to_read_metadata
+    ):
+        result = backend.contains(k3, False)
+        # Should return False due to hang threshold, not because of timeout
+        assert result is False
+
+    # Test batched_get_blocking() - should fail due to hang threshold
+    with unittest.mock.patch.object(
+        backend, "_batched_get_blocking", side_effect=slow_batched_get_blocking
+    ):
+        result = backend.batched_get_blocking([k1, k2])
+        # Should return [None, None] due to hang threshold
+        assert result == [None, None]
+
+    # Test get_blocking() again - should still fail due to hang threshold
+    with unittest.mock.patch.object(
+        backend,
+        "_load_bytes_from_disk_with_allocation",
+        side_effect=slow_load_bytes_from_disk,
+    ):
+        result = backend.get_blocking(k1)
+        # Should return None due to hang threshold
+        assert result is None
+
+
+def test_cross_operation_hang_threshold():
+    init_and_teardown(cross_operation_hang_threshold_test)
