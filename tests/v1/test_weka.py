@@ -320,3 +320,58 @@ def get_blocking_cufile_negative_return_test(backend: WekaGdsBackend):
 
 def test_weka_backend_get_blocking_cufile_negative_return():
     init_and_teardown(get_blocking_cufile_negative_return_test)
+
+
+def contains_corrupted_metadata_test(backend: WekaGdsBackend):
+    """Test that contains() handles corrupted metadata files gracefully"""
+    # Standard
+    import os
+    import unittest.mock
+
+    k = create_test_key()
+    memory_obj = create_test_memory_obj(backend)
+    future = backend.submit_put_task(k, memory_obj)
+    future.result()
+    assert backend.contains(k, False)
+
+    # Clear hot cache to force disk read
+    with backend.hot_lock:
+        backend.hot_cache.clear()
+
+    # Get the metadata file path
+    path, subdir_key, _, _ = backend._key_to_path(k)
+    metadata_path = path + ".metadata"
+
+    # Verify the metadata file exists (skip if test environment doesn't persist files)
+    if not os.path.exists(metadata_path):
+        # Create a dummy file for testing purposes
+        os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
+        with open(metadata_path, "w") as f:
+            f.write("dummy metadata")
+
+    # Mock the file reading to simulate a corrupted metadata file that exists but
+    # can't be read
+    def mock_open_side_effect(*args, **kwargs):
+        if args[0] == metadata_path:
+            raise OSError("Simulated file read error")
+        # For other files, use the real open
+        return unittest.mock.DEFAULT
+
+    with unittest.mock.patch(
+        "builtins.open", side_effect=mock_open_side_effect
+    ) as mock_open:
+        # This should not crash, but should return False and log an error
+        result = backend.contains(k, False)
+        # Should return False because metadata read failed
+        assert result is False
+        # Verify that file was attempted to be opened
+        mock_open.assert_called()
+
+        # Verify that the open call included our metadata file
+        calls = mock_open.call_args_list
+        metadata_calls = [call for call in calls if call[0][0] == metadata_path]
+        assert len(metadata_calls) > 0, f"Expected call to open {metadata_path}"
+
+
+def test_weka_backend_contains_corrupted_metadata():
+    init_and_teardown(contains_corrupted_metadata_test)

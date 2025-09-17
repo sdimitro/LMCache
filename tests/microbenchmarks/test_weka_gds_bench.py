@@ -254,6 +254,12 @@ class TestWekaGdsBenchmarks:
                     f"for batch_size={result.batch_size}"
                 )
 
+        # Save scaling results if requested
+        if benchmark_config.save_results:
+            filename = "scaling_analysis_results.json"
+            runner.save_results(filename)
+            print(f"\nScaling analysis results saved to: {filename}")
+
     @pytest.mark.slow
     def test_batched_get_blocking_comprehensive(
         self,
@@ -457,10 +463,16 @@ class TestWekaGdsBenchmarks:
                 f"for batch_size={batch_size}"
             )
 
+        # Save results if requested
+        if benchmark_config.save_results:
+            filename = "single_vs_batched_comparison.json"
+            runner.save_results(filename)
+            print(f"\nComparison results saved to: {filename}")
+
 
 # Utility test for running quick benchmarks during development
 @pytest.mark.benchmark
-def test_quick_benchmark(populated_backend):
+def test_quick_benchmark(benchmark_config: BenchmarkConfig, populated_backend):
     """Quick benchmark for development/debugging."""
 
     batch_size = 512
@@ -494,6 +506,12 @@ def test_quick_benchmark(populated_backend):
     )
 
     runner.print_summary(result)
+
+    # Save results if requested
+    if benchmark_config.save_results:
+        filename = "quick_benchmark_results.json"
+        runner.save_results(filename)
+        print(f"\nQuick benchmark results saved to: {filename}")
 
     # Validate data integrity
     if captured_data[0] is not None:
