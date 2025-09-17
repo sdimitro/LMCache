@@ -143,8 +143,6 @@ class WekaGdsBackend(StorageBackendInterface):
         if not os.path.exists(self.weka_path):
             os.makedirs(self.weka_path, exist_ok=True)
 
-        self.stats = None  # TODO(Serapheim): plug into LMCache Statistics
-
         self.hot_lock = threading.Lock()
         self.hot_cache: OrderedDict[CacheEngineKey, DiskCacheMetadata] = OrderedDict()
         self.metadata_dirs: set[str] = set()
@@ -541,12 +539,8 @@ class WekaGdsBackend(StorageBackendInterface):
         base_pointer: int,
         device_offset: int,
     ):
-        if base_pointer is None:
-            addr = ctypes.c_void_p(kv_chunk.data_ptr())
-            dev_offset = 0
-        else:
-            addr = ctypes.c_void_p(base_pointer)
-            dev_offset = device_offset
+        addr = ctypes.c_void_p(base_pointer)
+        dev_offset = device_offset
         tmp_path = path + tmp
         offset = _METADATA_MAX_SIZE
         metadata = pack_metadata(kv_chunk.shape, kv_chunk.dtype, kv_chunk.nbytes)
