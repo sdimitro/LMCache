@@ -314,14 +314,15 @@ class WekaGdsBackend(StorageBackendInterface):
         """
         Convert KV to bytes and async store bytes to disk.
         """
+        kv_chunk = memory_obj.tensor
+        assert kv_chunk is not None
+        path, subdir_key, l1_dir, l2_dir = self._key_to_path(key)
+        if subdir_key not in self.metadata_dirs:
+            os.makedirs(os.path.join(self.weka_path, l1_dir, l2_dir), exist_ok=True)
+            self.metadata_dirs.add(subdir_key)
+        tmp = ".tmp" + rand_suffix(self.rand, 8)
+
         try:
-            kv_chunk = memory_obj.tensor
-            assert kv_chunk is not None
-            path, subdir_key, l1_dir, l2_dir = self._key_to_path(key)
-            if subdir_key not in self.metadata_dirs:
-                os.makedirs(os.path.join(self.weka_path, l1_dir, l2_dir), exist_ok=True)
-                self.metadata_dirs.add(subdir_key)
-            tmp = ".tmp" + rand_suffix(self.rand, 8)
             metadata = await asyncio.to_thread(
                 self._save_gds_cufile,
                 path,
@@ -330,18 +331,37 @@ class WekaGdsBackend(StorageBackendInterface):
                 self.cufile_base_pointer,
                 memory_obj.metadata.address,
             )
+        except Exception as e:
+            logger.error(
+                f"GDS/cuFile write operation failed for key {key} at path {path}: "
+                f"tensor_shape={kv_chunk.shape}, tensor_dtype={kv_chunk.dtype}, "
+                f"tensor_size_bytes={kv_chunk.nbytes}, error={e}",
+                exc_info=True,
+            )
+            with self.put_lock:
+                self.put_tasks.discard(key)
+            return
 
-            self.insert_key(key, memory_obj)
-            memory_obj.ref_count_down()
+        self.insert_key(key, memory_obj)
+        memory_obj.ref_count_down()
 
+        try:
             task = asyncio.create_task(
                 save_metadata(path + _METADATA_FILE_SUFFIX, tmp, metadata)
             )
             self.save_metadata_tasks.add(task)
             task.add_done_callback(self.save_metadata_tasks.discard)
-        finally:
-            with self.put_lock:
-                self.put_tasks.discard(key)
+        except Exception as e:
+            logger.error(
+                f"POSIX metadata write operation failed for key {key} at path "
+                f"{path + _METADATA_FILE_SUFFIX}: metadata_size_bytes={len(metadata)}, "
+                f"tmp_suffix={tmp}, error={e}",
+                exc_info=True,
+            )
+            with self.hot_lock:
+                self.hot_cache.pop(key, None)
+        with self.put_lock:
+            self.put_tasks.discard(key)
 
     def insert_key(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
         path, _, _, _ = self._key_to_path(key)
