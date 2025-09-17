@@ -258,6 +258,17 @@ class WekaGdsBackend(StorageBackendInterface):
                 return self._read_metadata(key, path, subdir_key)
             except UnsupportedMetadataVersion:
                 logger.error(f"Unsupported metadata version for {path}, ignoring")
+            except (OSError, IOError) as e:
+                logger.error(
+                    f"Failed to read metadata file {path}: {type(e).__name__}: {e}. "
+                    f"File may be corrupted or inaccessible. "
+                    f"Ignoring cache entry for key {key}."
+                )
+            except Exception as e:
+                logger.error(
+                    f"Unexpected error reading metadata file {path}: "
+                    f"{type(e).__name__}: {e}. Ignoring cache entry for key {key}."
+                )
         return None
 
     def _key_to_path(
