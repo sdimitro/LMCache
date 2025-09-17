@@ -4,6 +4,8 @@ import asyncio
 import os
 import shutil
 import threading
+import time
+import unittest.mock
 
 # Third Party
 import torch
@@ -324,10 +326,6 @@ def test_weka_backend_get_blocking_cufile_negative_return():
 
 def contains_corrupted_metadata_test(backend: WekaGdsBackend):
     """Test that contains() handles corrupted metadata files gracefully"""
-    # Standard
-    import os
-    import unittest.mock
-
     k = create_test_key()
     memory_obj = create_test_memory_obj(backend)
     future = backend.submit_put_task(k, memory_obj)
@@ -375,3 +373,251 @@ def contains_corrupted_metadata_test(backend: WekaGdsBackend):
 
 def test_weka_backend_contains_corrupted_metadata():
     init_and_teardown(contains_corrupted_metadata_test)
+
+
+# ============================================================================
+# Timeout and Hang Threshold Tests
+# ============================================================================
+
+
+def contains_timeout_test(backend: WekaGdsBackend):
+    """Test that contains() handles operation timeout gracefully"""
+    k = create_test_key()
+
+    # Clear hot cache to force disk read
+    with backend.hot_lock:
+        backend.hot_cache.clear()
+
+    def slow_try_to_read_metadata(key):
+        """Mock function that takes longer than timeout"""
+        time.sleep(
+            backend.timeout_contains + 1.0
+        )  # Sleep longer than configured timeout
+        return None
+
+    with unittest.mock.patch.object(
+        backend, "_try_to_read_metadata", side_effect=slow_try_to_read_metadata
+    ):
+        # This should not crash, but should return False and log timeout error
+        result = backend.contains(k, False)
+        assert result is False
+
+
+def get_blocking_timeout_test(backend: WekaGdsBackend):
+    """Test that get_blocking() handles operation timeout gracefully"""
+    k = create_test_key()
+    memory_obj = create_test_memory_obj(backend)
+
+    # First put an item in the cache
+    future = backend.submit_put_task(k, memory_obj)
+    future.result()
+    assert backend.contains(k, False)
+
+    def slow_load_bytes_from_disk(key, path, dtype, shape):
+        """Mock function that takes longer than timeout"""
+        time.sleep(
+            backend.timeout_get_blocking + 1.0
+        )  # Sleep longer than configured timeout
+        return None
+
+    with unittest.mock.patch.object(
+        backend,
+        "_load_bytes_from_disk_with_allocation",
+        side_effect=slow_load_bytes_from_disk,
+    ):
+        # This should not crash, but should return None and log timeout error
+        result = backend.get_blocking(k)
+        assert result is None
+
+
+def batched_get_blocking_timeout_test(backend: WekaGdsBackend):
+    """Test that batched_get_blocking() handles operation timeout gracefully"""
+    k1 = create_test_key(chunk_hash=123)
+    k2 = create_test_key(chunk_hash=456)
+    memory_obj1 = create_test_memory_obj(backend)
+    memory_obj2 = create_test_memory_obj(backend)
+
+    # First put items in the cache
+    future1 = backend.submit_put_task(k1, memory_obj1)
+    future2 = backend.submit_put_task(k2, memory_obj2)
+    future1.result()
+    future2.result()
+
+    def slow_batched_get_blocking(keys):
+        """Mock function that takes longer than timeout"""
+        time.sleep(
+            backend.timeout_batched_get_blocking + 1.0
+        )  # Sleep longer than configured timeout
+        return [None] * len(keys)
+
+    with unittest.mock.patch.object(
+        backend, "_batched_get_blocking", side_effect=slow_batched_get_blocking
+    ):
+        # This should not crash, but should return [None, None] and log timeout error
+        result = backend.batched_get_blocking([k1, k2])
+        assert result == [None, None]
+
+
+def contains_hang_threshold_test(backend: WekaGdsBackend):
+    """Test that contains() handles hang threshold gracefully"""
+    k = create_test_key()
+
+    # Clear hot cache to force disk reads
+    with backend.hot_lock:
+        backend.hot_cache.clear()
+
+    def slow_try_to_read_metadata(key):
+        """Mock function that always times out"""
+        time.sleep(
+            backend.timeout_contains + 1.0
+        )  # Sleep longer than configured timeout
+        return None
+
+    # Reset timeout counter first
+    backend.op_manager.reset_timeout_count()
+
+    with unittest.mock.patch.object(
+        backend, "_try_to_read_metadata", side_effect=slow_try_to_read_metadata
+    ):
+        # First, trigger timeouts to reach the hang threshold
+        for i in range(backend.op_manager._hang_threshold):
+            result = backend.contains(create_test_key(chunk_hash=i), False)
+            assert result is False
+
+        # Verify we've reached the timeout count
+        assert (
+            backend.op_manager.get_timeout_count() >= backend.op_manager._hang_threshold
+        )
+
+        # Now the next call should trigger hang threshold
+        result = backend.contains(k, False)
+        # Should still return False, but due to hang threshold
+        assert result is False
+
+
+def get_blocking_hang_threshold_test(backend: WekaGdsBackend):
+    """Test that get_blocking() handles hang threshold gracefully"""
+    k = create_test_key()
+    memory_obj = create_test_memory_obj(backend)
+
+    # First put an item in the cache
+    future = backend.submit_put_task(k, memory_obj)
+    future.result()
+
+    def slow_load_bytes_from_disk(key, path, dtype, shape):
+        """Mock function that always times out"""
+        time.sleep(
+            backend.timeout_get_blocking + 1.0
+        )  # Sleep longer than configured timeout
+        return None
+
+    # Reset timeout counter first
+    backend.op_manager.reset_timeout_count()
+
+    with unittest.mock.patch.object(
+        backend,
+        "_load_bytes_from_disk_with_allocation",
+        side_effect=slow_load_bytes_from_disk,
+    ):
+        # First, trigger timeouts to reach the hang threshold
+        for i in range(backend.op_manager._hang_threshold):
+            test_key = create_test_key(chunk_hash=i)
+            # Put each test key in cache first
+            test_memory_obj = create_test_memory_obj(backend)
+            test_future = backend.submit_put_task(test_key, test_memory_obj)
+            test_future.result()
+
+            result = backend.get_blocking(test_key)
+            assert result is None
+
+        # Verify we've reached the timeout count
+        assert (
+            backend.op_manager.get_timeout_count() >= backend.op_manager._hang_threshold
+        )
+
+        # Now the next call should trigger hang threshold
+        result = backend.get_blocking(k)
+        # Should still return None, but due to hang threshold
+        assert result is None
+
+
+def batched_get_blocking_hang_threshold_test(backend: WekaGdsBackend):
+    """Test that batched_get_blocking() handles hang threshold gracefully"""
+    k1 = create_test_key(chunk_hash=123)
+    k2 = create_test_key(chunk_hash=456)
+    memory_obj1 = create_test_memory_obj(backend)
+    memory_obj2 = create_test_memory_obj(backend)
+
+    # First put items in the cache
+    future1 = backend.submit_put_task(k1, memory_obj1)
+    future2 = backend.submit_put_task(k2, memory_obj2)
+    future1.result()
+    future2.result()
+
+    def slow_batched_get_blocking(keys):
+        """Mock function that always times out"""
+        time.sleep(
+            backend.timeout_batched_get_blocking + 1.0
+        )  # Sleep longer than configured timeout
+        return [None] * len(keys)
+
+    # Reset timeout counter first
+    backend.op_manager.reset_timeout_count()
+
+    with unittest.mock.patch.object(
+        backend, "_batched_get_blocking", side_effect=slow_batched_get_blocking
+    ):
+        # First, trigger timeouts to reach the hang threshold
+        # Each batched call counts as one timeout, so we need hang_threshold
+        # iterations
+        for i in range(backend.op_manager._hang_threshold):
+            test_keys = [
+                create_test_key(chunk_hash=i * 2),
+                create_test_key(chunk_hash=i * 2 + 1),
+            ]
+
+            # Put each test key in cache first
+            for test_key in test_keys:
+                test_memory_obj = create_test_memory_obj(backend)
+                test_future = backend.submit_put_task(test_key, test_memory_obj)
+                test_future.result()
+
+            result = backend.batched_get_blocking(test_keys)
+            assert result == [None, None]
+
+        # Verify we've reached the timeout count
+        assert (
+            backend.op_manager.get_timeout_count() >= backend.op_manager._hang_threshold
+        )
+
+        # Now the next call should trigger hang threshold
+        result = backend.batched_get_blocking([k1, k2])
+        # Should still return [None, None], but due to hang threshold
+        assert result == [
+            None,
+            None,
+        ]
+
+
+def test_contains_timeout():
+    init_and_teardown(contains_timeout_test)
+
+
+def test_get_blocking_timeout():
+    init_and_teardown(get_blocking_timeout_test)
+
+
+def test_batched_get_blocking_timeout():
+    init_and_teardown(batched_get_blocking_timeout_test)
+
+
+def test_contains_hang_threshold():
+    init_and_teardown(contains_hang_threshold_test)
+
+
+def test_get_blocking_hang_threshold():
+    init_and_teardown(get_blocking_hang_threshold_test)
+
+
+def test_batched_get_blocking_hang_threshold():
+    init_and_teardown(batched_get_blocking_hang_threshold_test)
