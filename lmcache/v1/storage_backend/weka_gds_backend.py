@@ -2,7 +2,8 @@
 # Standard
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import List, Optional, Sequence, Tuple
+from concurrent.futures import TimeoutError as ConcurrentTimeoutError
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 import asyncio
 import ctypes
 import os
@@ -22,6 +23,67 @@ from lmcache.utils import CacheEngineKey, DiskCacheMetadata, _lmcache_nvtx_annot
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryAllocatorInterface, MemoryObj
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
+
+
+class OperationTimeoutError(Exception):
+    """Exception raised when operations timeout."""
+
+    pass
+
+
+class OperationHangThresholdReached(Exception):
+    """Exception raised when operations hang threshold is reached."""
+
+    pass
+
+
+class OperationManager:
+    def __init__(self, num_threads: int = 4, hang_threshold: int = 10):
+        self.timeout_pool = ThreadPoolExecutor(
+            max_workers=num_threads, thread_name_prefix="fs-timeout"
+        )
+        self._timeout_count = 0
+        self._timeout_lock = threading.Lock()
+        self._hang_threshold = hang_threshold
+
+    def run_with_timeout(
+        self,
+        func: Callable[[], Any],
+        timeout_seconds: float,
+        label: str = "default_label",
+        metadata: Any = None,
+    ) -> Any:
+        if self._timeout_count >= self._hang_threshold:
+            raise OperationHangThresholdReached(
+                f"Operation hang threshold reached. Will not run operation '{label}'",
+                metadata,
+            )
+        future = self.timeout_pool.submit(func)
+        try:
+            return future.result(timeout=timeout_seconds)
+        except ConcurrentTimeoutError as err:
+            with self._timeout_lock:
+                self._timeout_count += 1
+            raise OperationTimeoutError(
+                f"Operation '{label}' timed out after {timeout_seconds} seconds",
+                metadata,
+            ) from err
+
+    def shutdown(self):
+        self.timeout_pool.shutdown(wait=True)
+
+    def get_timeout_count(self) -> int:
+        """Get the current count of timed-out operations."""
+        with self._timeout_lock:
+            return self._timeout_count
+
+    def reset_timeout_count(self) -> int:
+        """Reset the timeout counter and return the previous count."""
+        with self._timeout_lock:
+            old_count = self._timeout_count
+            self._timeout_count = 0
+            return old_count
+
 
 logger = init_logger(__name__)
 
@@ -140,8 +202,7 @@ class WekaGdsBackend(StorageBackendInterface):
             "Need to specify weka_path for WekaGdsBackend"
         )
         self.weka_path = config.weka_path
-        if not os.path.exists(self.weka_path):
-            os.makedirs(self.weka_path, exist_ok=True)
+        os.makedirs(self.weka_path, exist_ok=True)
 
         self.hot_lock = threading.Lock()
         self.hot_cache: OrderedDict[CacheEngineKey, DiskCacheMetadata] = OrderedDict()
@@ -154,6 +215,15 @@ class WekaGdsBackend(StorageBackendInterface):
         thread_count = config.extra_config.get("gds_io_threads", 4)
         self._thread_pool = ThreadPoolExecutor(
             max_workers=thread_count, thread_name_prefix="weka-gds-io"
+        )
+        self.op_manager = OperationManager(
+            config.extra_config.get("operation_manager_threads", 4),
+            config.extra_config.get("operation_hang_threshold", 10),
+        )
+        self.timeout_contains = config.extra_config.get("timeout_contains", 1.0)
+        self.timeout_get_blocking = config.extra_config.get("timeout_get_blocking", 5.0)
+        self.timeout_batched_get_blocking = config.extra_config.get(
+            "timeout_batched_get_blocking", 5.0
         )
 
         self._cufile_driver = self.cufile.CuFileDriver()
@@ -244,8 +314,26 @@ class WekaGdsBackend(StorageBackendInterface):
             res = key in self.hot_cache
         if res:
             return True
-        if self._try_to_read_metadata(key):
-            return True
+        try:
+            read_from_disk = self.op_manager.run_with_timeout(
+                lambda: self._try_to_read_metadata(key),
+                self.timeout_contains,
+                "contains",
+                key,
+            )
+            if read_from_disk:
+                return True
+        except OperationHangThresholdReached:
+            logger.error(
+                "Contains hang threshold reached. Will not run operation",
+                exc_info=True,
+            )
+            return False
+        except OperationTimeoutError:
+            logger.error(
+                f"Contains timed out after {self.timeout_contains} seconds",
+                exc_info=True,
+            )
         return False
 
     def _try_to_read_metadata(self, key: CacheEngineKey) -> Optional[DiskCacheMetadata]:
@@ -403,7 +491,27 @@ class WekaGdsBackend(StorageBackendInterface):
         shape = entry.shape
         assert dtype is not None
         assert shape is not None
-        return self._load_bytes_from_disk_with_allocation(key, path, dtype, shape)
+        try:
+            return self.op_manager.run_with_timeout(
+                lambda: self._load_bytes_from_disk_with_allocation(
+                    key, path, dtype, shape
+                ),
+                self.timeout_get_blocking,
+                "get_blocking",
+                key,
+            )
+        except OperationHangThresholdReached:
+            logger.error(
+                "Get blocking hang threshold reached. Will not run operation",
+                exc_info=True,
+            )
+            return None
+        except OperationTimeoutError:
+            logger.error(
+                f"Get blocking timed out after {self.timeout_get_blocking} seconds",
+                exc_info=True,
+            )
+            return None
 
     def _load_bytes_from_disk_with_memory(
         self,
@@ -483,6 +591,31 @@ class WekaGdsBackend(StorageBackendInterface):
         return self._load_bytes_from_disk_with_memory(key, path, memory_obj)
 
     def batched_get_blocking(
+        self,
+        keys: List[CacheEngineKey],
+    ) -> list[MemoryObj | None]:
+        try:
+            return self.op_manager.run_with_timeout(
+                lambda: self._batched_get_blocking(keys),
+                self.timeout_batched_get_blocking,
+                "batched_get_blocking",
+                len(keys),
+            )
+        except OperationHangThresholdReached:
+            logger.error(
+                "Batched get blocking hang threshold reached. Will not run operation",
+                exc_info=True,
+            )
+            return [None] * len(keys)
+        except OperationTimeoutError:
+            logger.error(
+                f"Batched get blocking timed out after "
+                f"{self.timeout_batched_get_blocking} seconds",
+                exc_info=True,
+            )
+            return [None] * len(keys)
+
+    def _batched_get_blocking(
         self,
         keys: List[CacheEngineKey],
     ) -> list[MemoryObj | None]:
