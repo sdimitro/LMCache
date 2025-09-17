@@ -318,32 +318,34 @@ class WekaGdsBackend(StorageBackendInterface):
         """
         Convert KV to bytes and async store bytes to disk.
         """
-        kv_chunk = memory_obj.tensor
-        assert kv_chunk is not None
-        path, subdir_key, l1_dir, l2_dir = self._key_to_path(key)
-        if subdir_key not in self.metadata_dirs:
-            os.makedirs(os.path.join(self.weka_path, l1_dir, l2_dir), exist_ok=True)
-            self.metadata_dirs.add(subdir_key)
-        tmp = ".tmp" + rand_suffix(self.rand, 8)
-        metadata = await asyncio.to_thread(
-            self._save_gds_cufile,
-            path,
-            tmp,
-            kv_chunk,
-            self.cufile_base_pointer,
-            memory_obj.metadata.address,
-        )
+        try:
+            kv_chunk = memory_obj.tensor
+            assert kv_chunk is not None
+            path, subdir_key, l1_dir, l2_dir = self._key_to_path(key)
+            if subdir_key not in self.metadata_dirs:
+                os.makedirs(os.path.join(self.weka_path, l1_dir, l2_dir), exist_ok=True)
+                self.metadata_dirs.add(subdir_key)
+            tmp = ".tmp" + rand_suffix(self.rand, 8)
+            metadata = await asyncio.to_thread(
+                self._save_gds_cufile,
+                path,
+                tmp,
+                kv_chunk,
+                self.cufile_base_pointer,
+                memory_obj.metadata.address,
+            )
 
-        self.insert_key(key, memory_obj)
-        memory_obj.ref_count_down()
+            self.insert_key(key, memory_obj)
+            memory_obj.ref_count_down()
 
-        task = asyncio.create_task(
-            save_metadata(path + _METADATA_FILE_SUFFIX, tmp, metadata)
-        )
-        self.save_metadata_tasks.add(task)
-        task.add_done_callback(self.save_metadata_tasks.discard)
-        with self.put_lock:
-            self.put_tasks.discard(key)
+            task = asyncio.create_task(
+                save_metadata(path + _METADATA_FILE_SUFFIX, tmp, metadata)
+            )
+            self.save_metadata_tasks.add(task)
+            task.add_done_callback(self.save_metadata_tasks.discard)
+        finally:
+            with self.put_lock:
+                self.put_tasks.discard(key)
 
     def insert_key(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
         path, _, _, _ = self._key_to_path(key)
@@ -468,7 +470,7 @@ class WekaGdsBackend(StorageBackendInterface):
         """
         memory_obj = self.memory_allocator.allocate(shape, dtype)
         if memory_obj is None:
-            logger.debug("Memory allocation failed during sync disk load.")
+            logger.error("Memory allocation failed during sync disk load.")
             return None
         assert memory_obj.tensor is not None
         assert memory_obj.tensor.is_cuda
@@ -569,13 +571,17 @@ class WekaGdsBackend(StorageBackendInterface):
         dev_offset: int,
     ) -> int:
         # Read data from disk into a GPU buffer
-        with self.cufile.CuFile(file_path, "r") as f:
-            return f.read(
-                gpu_pointer,
-                size_in_bytes,
-                file_offset=file_offset,
-                dev_offset=dev_offset,
-            )
+        try:
+            with self.cufile.CuFile(file_path, "r") as f:
+                return f.read(
+                    gpu_pointer,
+                    size_in_bytes,
+                    file_offset=file_offset,
+                    dev_offset=dev_offset,
+                )
+        except Exception as e:
+            logger.error(f"CuFile read failed for {file_path}: {e}", exc_info=True)
+            return -1
 
     def pin(self, key: CacheEngineKey) -> bool:
         # TODO(Serapheim): Implement this
