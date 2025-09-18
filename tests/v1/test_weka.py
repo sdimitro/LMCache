@@ -485,8 +485,8 @@ def contains_hang_threshold_test(backend: WekaGdsBackend):
         )  # Sleep longer than configured timeout
         return None
 
-    # Reset timeout counter first
-    backend.op_manager.reset_timeout_count()
+    # Reset failure counter first
+    backend.op_manager.reset_failure_count()
 
     with unittest.mock.patch.object(
         backend, "_try_to_read_metadata", side_effect=slow_try_to_read_metadata
@@ -496,9 +496,9 @@ def contains_hang_threshold_test(backend: WekaGdsBackend):
             result = backend.contains(create_test_key(chunk_hash=i), False)
             assert result is False
 
-        # Verify we've reached the timeout count
+        # Verify we've reached the failure count
         assert (
-            backend.op_manager.get_timeout_count() >= backend.op_manager._hang_threshold
+            backend.op_manager.get_failure_count() >= backend.op_manager._hang_threshold
         )
 
         # Now the next call should trigger hang threshold
@@ -527,8 +527,8 @@ def get_blocking_hang_threshold_test(backend: WekaGdsBackend):
         )  # Sleep longer than configured timeout
         return None
 
-    # Reset timeout counter first
-    backend.op_manager.reset_timeout_count()
+    # Reset failure counter first
+    backend.op_manager.reset_failure_count()
 
     with unittest.mock.patch.object(
         backend,
@@ -546,9 +546,9 @@ def get_blocking_hang_threshold_test(backend: WekaGdsBackend):
             result = backend.get_blocking(test_key)
             assert result is None
 
-        # Verify we've reached the timeout count
+        # Verify we've reached the failure count
         assert (
-            backend.op_manager.get_timeout_count() >= backend.op_manager._hang_threshold
+            backend.op_manager.get_failure_count() >= backend.op_manager._hang_threshold
         )
 
         # Now the next call should trigger hang threshold
@@ -581,8 +581,8 @@ def batched_get_blocking_hang_threshold_test(backend: WekaGdsBackend):
         )  # Sleep longer than configured timeout
         return [None] * len(keys)
 
-    # Reset timeout counter first
-    backend.op_manager.reset_timeout_count()
+    # Reset failure counter first
+    backend.op_manager.reset_failure_count()
 
     with unittest.mock.patch.object(
         backend, "_batched_get_blocking", side_effect=slow_batched_get_blocking
@@ -605,9 +605,9 @@ def batched_get_blocking_hang_threshold_test(backend: WekaGdsBackend):
             result = backend.batched_get_blocking(test_keys)
             assert result == [None, None]
 
-        # Verify we've reached the timeout count
+        # Verify we've reached the failure count
         assert (
-            backend.op_manager.get_timeout_count() >= backend.op_manager._hang_threshold
+            backend.op_manager.get_failure_count() >= backend.op_manager._hang_threshold
         )
 
         # Now the next call should trigger hang threshold
@@ -654,8 +654,8 @@ def cross_operation_hang_threshold_test(backend: WekaGdsBackend):
         time.sleep(backend.timeout_batched_get_blocking + 1.0)
         return [None] * len(keys)
 
-    # Reset timeout counter first
-    backend.op_manager.reset_timeout_count()
+    # Reset failure counter first
+    backend.op_manager.reset_failure_count()
 
     # First, use get_blocking to hit the hang threshold
     with unittest.mock.patch.object(
@@ -674,9 +674,9 @@ def cross_operation_hang_threshold_test(backend: WekaGdsBackend):
             result = backend.get_blocking(test_key)
             assert result is None
 
-        # Verify we've reached the timeout count
+        # Verify we've reached the failure count
         assert (
-            backend.op_manager.get_timeout_count() >= backend.op_manager._hang_threshold
+            backend.op_manager.get_failure_count() >= backend.op_manager._hang_threshold
         )
 
     # Now test that ALL operations fail due to shared hang threshold
@@ -713,3 +713,219 @@ def cross_operation_hang_threshold_test(backend: WekaGdsBackend):
 
 def test_cross_operation_hang_threshold():
     init_and_teardown(cross_operation_hang_threshold_test)
+
+
+def reset_file_threshold_recovery_test(backend: WekaGdsBackend):
+    """Test that the reset file functionality allows recovery from hang threshold"""
+    k1 = create_test_key(chunk_hash=111111)
+    k2 = create_test_key(chunk_hash=222222)
+    k3 = create_test_key(chunk_hash=333333)
+
+    memory_obj1 = create_test_memory_obj(backend)
+    memory_obj2 = create_test_memory_obj(backend)
+    memory_obj3 = create_test_memory_obj(backend)
+
+    # Put items in cache for get operations
+    future1 = backend.submit_put_task(k1, memory_obj1)
+    future2 = backend.submit_put_task(k2, memory_obj2)
+    future3 = backend.submit_put_task(k3, memory_obj3)
+    future1.result()
+    future2.result()
+    future3.result()
+
+    def slow_load_bytes_from_disk(key, path, dtype, shape):
+        """Mock function that always times out"""
+        time.sleep(backend.timeout_get_blocking + 1.0)
+        return None
+
+    def normal_load_bytes_from_disk(key, path, dtype, shape):
+        """Mock function that works normally (doesn't timeout)"""
+        return None  # Simulate successful load by returning None quickly
+
+    # Clean up any existing reset file and reset failure counter to ensure clean
+    # test state
+    reset_file_path = backend.op_manager._reset_file
+    if os.path.exists(reset_file_path):
+        os.remove(reset_file_path)
+        print(f"Cleaned up existing reset file at {reset_file_path}")
+
+    backend.op_manager.reset_failure_count()
+    print(
+        f"Initial state - Failure count: {backend.op_manager.get_failure_count()}, "
+        f"Reset file exists: {os.path.exists(reset_file_path)}"
+    )
+
+    # Step 1: Trigger enough failures to reach hang threshold
+    with unittest.mock.patch.object(
+        backend,
+        "_load_bytes_from_disk_with_allocation",
+        side_effect=slow_load_bytes_from_disk,
+    ):
+        # Trigger timeouts with get_blocking to reach the hang threshold
+        for i in range(backend.op_manager._hang_threshold):
+            test_key = create_test_key(chunk_hash=2000 + i)
+            # Put each test key in cache first
+            test_memory_obj = create_test_memory_obj(backend)
+            test_future = backend.submit_put_task(test_key, test_memory_obj)
+            test_future.result()
+
+            result = backend.get_blocking(test_key)
+            assert result is None
+
+        # Verify we've reached the failure count threshold
+        assert (
+            backend.op_manager.get_failure_count() >= backend.op_manager._hang_threshold
+        )
+        print(
+            f"After triggering failures - Failure count: "
+            f"{backend.op_manager.get_failure_count()}, "
+            f"Reset file exists: {os.path.exists(reset_file_path)}"
+        )
+
+    # Step 2: Verify operations fail due to hang threshold (not timeout)
+    # We'll use a non-timing-out mock to prove the failure is due to threshold
+    with unittest.mock.patch.object(
+        backend,
+        "_load_bytes_from_disk_with_allocation",
+        side_effect=normal_load_bytes_from_disk,
+    ):
+        # This should fail immediately due to hang threshold, not due to timeout
+        result = backend.get_blocking(k1)
+        assert result is None  # Should fail due to hang threshold
+
+        # Test contains() - should also fail due to hang threshold
+        with backend.hot_lock:
+            backend.hot_cache.clear()
+
+        def normal_try_to_read_metadata(key):
+            """Mock function that works normally (doesn't timeout)"""
+            return None
+
+        with unittest.mock.patch.object(
+            backend, "_try_to_read_metadata", side_effect=normal_try_to_read_metadata
+        ):
+            result = backend.contains(k2, False)
+            assert result is False  # Should fail due to hang threshold
+
+    print(
+        f"After step 2 - Failure count: {backend.op_manager.get_failure_count()}, "
+        f"Reset file exists: {os.path.exists(reset_file_path)}"
+    )
+
+    # Step 3: Create reset file and verify operations succeed after reset
+
+    # Ensure reset file doesn't exist initially
+    if os.path.exists(reset_file_path):
+        os.remove(reset_file_path)
+
+    # Create the reset file
+    with open(reset_file_path, "w") as f:
+        f.write("reset")
+
+    # Verify the reset file exists
+    assert os.path.exists(reset_file_path)
+
+    # Step 4: Now operations should succeed because reset file will be detected
+    # IMPORTANT: Don't reset failure count here - let the reset file logic
+    # handle it. The failure count should still be >= threshold to trigger the
+    # reset file logic
+    print(f"Reset file path: {reset_file_path}")
+    print(f"Reset file exists before operation: {os.path.exists(reset_file_path)}")
+    print(f"Failure count before operation: {backend.op_manager.get_failure_count()}")
+
+    # Check hot_cache state
+    with backend.hot_lock:
+        hot_cache_keys = list(backend.hot_cache.keys())
+        print(f"Keys in hot_cache: {[key.chunk_hash for key in hot_cache_keys]}")
+        print(f"k3 in hot_cache: {k3 in backend.hot_cache}")
+        if k3 in backend.hot_cache:
+            print(f"k3 entry: {backend.hot_cache[k3]}")
+
+    # Add a mock to intercept the OperationManager.run_with_timeout call
+    original_run_with_timeout = backend.op_manager.run_with_timeout
+
+    def debug_run_with_timeout(
+        func, timeout_seconds, label="default_label", metadata=None
+    ):
+        print(
+            f"DEBUG: run_with_timeout called - "
+            f"failure_count={backend.op_manager.get_failure_count()}, "
+            f"reset_file_exists={os.path.exists(reset_file_path)}"
+        )
+        return original_run_with_timeout(func, timeout_seconds, label, metadata)
+
+    with unittest.mock.patch.object(
+        backend.op_manager, "run_with_timeout", side_effect=debug_run_with_timeout
+    ):
+
+        def normal_try_to_read_metadata_for_reset(key):
+            """Mock function that works normally for reset test"""
+            return None
+
+        with unittest.mock.patch.object(
+            backend,
+            "_try_to_read_metadata",
+            side_effect=normal_try_to_read_metadata_for_reset,
+        ):
+            # This should now succeed because the reset file will be detected and
+            # failure count reset. Use contains() which always calls
+            # run_with_timeout regardless of hot_cache state
+            # Use any key
+            test_key_for_reset = create_test_key(chunk_hash=9999)
+            try:
+                result = backend.contains(test_key_for_reset, False)
+                print(f"Contains operation succeeded, result: {result}")
+                operation_succeeded = True
+            except Exception as e:
+                print(
+                    f"Contains operation failed with exception: {type(e).__name__}: {e}"
+                )
+                result = False
+                operation_succeeded = False
+
+        # Check status after the operation
+        print(f"Reset file exists after operation: {os.path.exists(reset_file_path)}")
+        print(
+            f"Failure count after operation: {backend.op_manager.get_failure_count()}"
+        )
+
+        # Verify that the operation succeeded (no hang threshold exception)
+        assert operation_succeeded, (
+            "Operation should have succeeded after reset file was processed"
+        )
+
+        # Verify that the reset file has been removed
+        assert not os.path.exists(reset_file_path), (
+            f"Reset file should have been removed but still exists at {reset_file_path}"
+        )
+
+        # Verify that the failure count has been reset
+        assert backend.op_manager.get_failure_count() == 0, (
+            f"Failure count should be 0 but is {backend.op_manager.get_failure_count()}"
+        )
+
+    # Step 5: Verify continued operations work normally after reset
+    with unittest.mock.patch.object(
+        backend,
+        "_load_bytes_from_disk_with_allocation",
+        side_effect=normal_load_bytes_from_disk,
+    ):
+        # These should all work fine now
+        result1 = backend.get_blocking(k1)
+        result2 = backend.get_blocking(k2)
+        assert result1 is None  # Normal mock response
+        assert result2 is None  # Normal mock response
+
+        # Contains should also work
+        with backend.hot_lock:
+            backend.hot_cache.clear()
+
+        with unittest.mock.patch.object(
+            backend, "_try_to_read_metadata", side_effect=normal_try_to_read_metadata
+        ):
+            result = backend.contains(k3, False)
+            assert result is False  # Normal mock response, but no threshold exception
+
+
+def test_reset_file_threshold_recovery():
+    init_and_teardown(reset_file_threshold_recovery_test)
