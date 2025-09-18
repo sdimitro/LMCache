@@ -24,6 +24,8 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryAllocatorInterface, MemoryObj
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
 
+logger = init_logger(__name__)
+
 
 class OperationTimeoutError(Exception):
     """Exception raised when operations timeout."""
@@ -38,13 +40,19 @@ class OperationHangThresholdReached(Exception):
 
 
 class OperationManager:
-    def __init__(self, num_threads: int = 4, hang_threshold: int = 10):
+    def __init__(
+        self,
+        num_threads: int = 4,
+        hang_threshold: int = 10,
+        reset_file: str = "/tmp/lmcache_operation_manager_reset",
+    ):
         self.timeout_pool = ThreadPoolExecutor(
             max_workers=num_threads, thread_name_prefix="fs-timeout"
         )
-        self._timeout_count = 0
-        self._timeout_lock = threading.Lock()
+        self._failure_count = 0
+        self._failure_lock = threading.Lock()
         self._hang_threshold = hang_threshold
+        self._reset_file = reset_file
 
     def run_with_timeout(
         self,
@@ -53,39 +61,51 @@ class OperationManager:
         label: str = "default_label",
         metadata: Any = None,
     ) -> Any:
-        if self._timeout_count >= self._hang_threshold:
-            raise OperationHangThresholdReached(
-                f"Operation hang threshold reached. Will not run operation '{label}'",
-                metadata,
-            )
+        if self._failure_count >= self._hang_threshold:
+            if os.path.exists(self._reset_file):
+                os.remove(self._reset_file)
+                self.reset_failure_count()
+                logger.info(
+                    f"Resetting operation manager failure count due to reset file "
+                    f"{self._reset_file}"
+                )
+            else:
+                raise OperationHangThresholdReached(
+                    f"Operation hang threshold reached. Will not run operation "
+                    f"'{label}'",
+                    metadata,
+                )
         future = self.timeout_pool.submit(func)
         try:
             return future.result(timeout=timeout_seconds)
         except ConcurrentTimeoutError as err:
-            with self._timeout_lock:
-                self._timeout_count += 1
+            count = self.increment_failure_count()
             raise OperationTimeoutError(
                 f"Operation '{label}' timed out after {timeout_seconds} seconds",
                 metadata,
+                count,
             ) from err
 
     def shutdown(self):
         self.timeout_pool.shutdown(wait=True)
 
-    def get_timeout_count(self) -> int:
-        """Get the current count of timed-out operations."""
-        with self._timeout_lock:
-            return self._timeout_count
+    def increment_failure_count(self) -> int:
+        with self._failure_lock:
+            self._failure_count += 1
+            return self._failure_count
 
-    def reset_timeout_count(self) -> int:
+    def get_failure_count(self) -> int:
+        """Get the current count of timed-out operations."""
+        with self._failure_lock:
+            return self._failure_count
+
+    def reset_failure_count(self) -> int:
         """Reset the timeout counter and return the previous count."""
-        with self._timeout_lock:
-            old_count = self._timeout_count
-            self._timeout_count = 0
+        with self._failure_lock:
+            old_count = self._failure_count
+            self._failure_count = 0
             return old_count
 
-
-logger = init_logger(__name__)
 
 _METADATA_FILE_SUFFIX = ".metadata"
 _DATA_FILE_SUFFIX = ".weka1"
@@ -753,5 +773,6 @@ class WekaGdsBackend(StorageBackendInterface):
         raise NotImplementedError("Remote backend does not support remove now.")
 
     def close(self) -> None:
+        self.op_manager.shutdown()
         self._thread_pool.shutdown(wait=True)
         logger.info("Weka backend closed.")
