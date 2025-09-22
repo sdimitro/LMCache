@@ -172,7 +172,7 @@ def test_key_factory():
         model_name: str = "meta-llama/Llama-3.1-70B-Instruct",
         world_size: int = 8,
         worker_id: int = 0,
-        chunk_hash: int = None,
+        chunk_hash: int | None = None,
     ) -> CacheEngineKey:
         if chunk_hash is None:
             # Standard
@@ -200,7 +200,11 @@ def memory_obj_factory():
         shape: tuple = (2, 16, 8, 128),
         dtype: torch.dtype = torch.bfloat16,
     ) -> MemoryObj:
-        return backend.memory_allocator.allocate(shape, dtype, fmt=MemoryFormat.KV_T2D)
+        memory_obj = backend.memory_allocator.allocate(
+            shape, dtype, fmt=MemoryFormat.KV_T2D
+        )
+        assert memory_obj is not None, "Failed to allocate memory object"
+        return memory_obj
 
     return _create_memory_obj
 
@@ -240,7 +244,7 @@ def populated_backend(weka_backend_factory, test_data_generator):
     def _create_populated_backend(
         batch_size: int,
         tensor_shape: tuple = (2, 16, 8, 128),
-        backend_config: dict = None,
+        backend_config: dict | None = None,
     ) -> tuple[WekaGdsBackend, List[CacheEngineKey], List[torch.Tensor]]:
         if backend_config is None:
             backend_config = {}
@@ -259,9 +263,59 @@ def populated_backend(weka_backend_factory, test_data_generator):
                 reference_data.append(None)
 
         # Store all data in the backend
-        futures = backend.batched_submit_put_task(keys, memory_objs)
-        for future in futures:
-            future.result()  # Wait for completion
+        result = backend.batched_submit_put_task(keys, memory_objs)
+        assert result is None  # Interface specifies this should return None
+
+        # Wait for all put tasks to complete by monitoring backend state
+        def wait_for_put_tasks_completion():
+            """
+            Wait for all put tasks to complete by checking
+            put_tasks and asyncio loop.
+            """
+            # Standard
+            import asyncio
+            import time
+
+            timeout = 30.0  # 30 second timeout
+            start_time = time.time()
+
+            while time.time() - start_time < timeout:
+                # Check if all our specific keys are no longer in put_tasks
+                keys_still_pending = [
+                    key for key in keys if backend.exists_in_put_tasks(key)
+                ]
+
+                if not keys_still_pending:
+                    # Also wait for any remaining asyncio tasks in the backend's loop
+                    # to complete
+                    async def wait_for_loop_tasks():
+                        current_task = asyncio.current_task(backend.loop)
+                        tasks = [
+                            task
+                            for task in asyncio.all_tasks(backend.loop)
+                            if not task.done() and task is not current_task
+                        ]
+                        if tasks:
+                            await asyncio.gather(*tasks, return_exceptions=True)
+
+                    # Wait for any remaining async tasks to complete
+                    future = asyncio.run_coroutine_threadsafe(
+                        wait_for_loop_tasks(), backend.loop
+                    )
+                    try:
+                        future.result(timeout=5.0)
+                    except Exception:
+                        pass  # Ignore timeout/errors in cleanup
+
+                    break
+
+                time.sleep(0.1)  # Small delay to avoid busy waiting
+            else:
+                raise TimeoutError(
+                    f"Put tasks did not complete within {timeout} seconds"
+                )
+
+        wait_for_put_tasks_completion()
 
         # Verify all data is stored
         for key in keys:

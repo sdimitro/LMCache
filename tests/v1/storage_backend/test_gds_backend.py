@@ -149,12 +149,14 @@ class TestGdsBackend:
     async def test_batched_submit_put_task(self, gds_backend):
         keys = [create_test_key(i) for i in range(2, 5)]
         memory_objs = [create_test_memory_obj(device="cpu") for _ in range(3)]
+
         futures = gds_backend.batched_submit_put_task(keys, memory_objs)
         assert futures is not None
         assert len(futures) == 3
         for future in futures:
             assert future is not None
             future.result(timeout=5)
+
         for key in keys:
             assert gds_backend.contains(key)
 

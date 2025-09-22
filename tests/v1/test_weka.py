@@ -70,6 +70,7 @@ def create_test_memory_obj(
     memory_obj = backend.memory_allocator.allocate(
         shape, dtype, fmt=MemoryFormat.KV_T2D
     )
+    assert memory_obj is not None, "Failed to allocate memory object"
     return memory_obj
 
 
@@ -134,12 +135,55 @@ def basic_batch_store_load_test(backend: WekaGdsBackend):
     for chunk_hash in [0xDEADBEEF, 0xCAFEBABE, 0xBADB0E]:
         keys.append(create_test_key(chunk_hash=chunk_hash))
     memory_objs = [create_test_memory_obj(backend) for _ in range(len(keys))]
-    futures = backend.batched_submit_put_task(keys, memory_objs)
-    assert futures is not None
-    assert len(futures) == 3
-    for future in futures:
-        assert future is not None
-        future.result()
+
+    backend.batched_submit_put_task(keys, memory_objs)
+
+    # Wait for all put tasks to complete by monitoring the backend's state
+    def wait_for_put_tasks_completion():
+        """Wait for all put tasks to complete by checking put_tasks and asyncio loop"""
+        # Standard
+        import asyncio
+        import time
+
+        timeout = 30.0  # 30 second timeout
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            # Check if all our specific keys are no longer in put_tasks
+            keys_still_pending = [
+                key for key in keys if backend.exists_in_put_tasks(key)
+            ]
+
+            if not keys_still_pending:
+                # Also wait for any remaining asyncio tasks in the backend's loop
+                # to complete
+                async def wait_for_loop_tasks():
+                    current_task = asyncio.current_task(backend.loop)
+                    tasks = [
+                        task
+                        for task in asyncio.all_tasks(backend.loop)
+                        if not task.done() and task is not current_task
+                    ]
+                    if tasks:
+                        await asyncio.gather(*tasks, return_exceptions=True)
+
+                # Wait for any remaining async tasks to complete
+                future = asyncio.run_coroutine_threadsafe(
+                    wait_for_loop_tasks(), backend.loop
+                )
+                try:
+                    future.result(timeout=5.0)
+                except Exception:
+                    pass  # Ignore timeout/errors in cleanup
+
+                break
+
+            time.sleep(0.1)  # Small delay to avoid busy waiting
+        else:
+            raise TimeoutError(f"Put tasks did not complete within {timeout} seconds")
+
+    wait_for_put_tasks_completion()
+
     for key in keys:
         assert backend.contains(key)
 
@@ -688,17 +732,17 @@ def cross_operation_hang_threshold_test(backend: WekaGdsBackend):
     with unittest.mock.patch.object(
         backend, "_try_to_read_metadata", side_effect=slow_try_to_read_metadata
     ):
-        result = backend.contains(k3, False)
+        contains_result = backend.contains(k3, False)
         # Should return False due to hang threshold, not because of timeout
-        assert result is False
+        assert contains_result is False
 
     # Test batched_get_blocking() - should fail due to hang threshold
     with unittest.mock.patch.object(
         backend, "_batched_get_blocking", side_effect=slow_batched_get_blocking
     ):
-        result = backend.batched_get_blocking([k1, k2])
+        batched_get_result = backend.batched_get_blocking([k1, k2])
         # Should return [None, None] due to hang threshold
-        assert result == [None, None]
+        assert batched_get_result == [None, None]
 
     # Test get_blocking() again - should still fail due to hang threshold
     with unittest.mock.patch.object(
@@ -706,9 +750,9 @@ def cross_operation_hang_threshold_test(backend: WekaGdsBackend):
         "_load_bytes_from_disk_with_allocation",
         side_effect=slow_load_bytes_from_disk,
     ):
-        result = backend.get_blocking(k1)
+        get_result = backend.get_blocking(k1)
         # Should return None due to hang threshold
-        assert result is None
+        assert get_result is None
 
 
 def test_cross_operation_hang_threshold():
@@ -804,8 +848,8 @@ def reset_file_threshold_recovery_test(backend: WekaGdsBackend):
         with unittest.mock.patch.object(
             backend, "_try_to_read_metadata", side_effect=normal_try_to_read_metadata
         ):
-            result = backend.contains(k2, False)
-            assert result is False  # Should fail due to hang threshold
+            contains_result = backend.contains(k2, False)
+            assert contains_result is False  # Should fail due to hang threshold
 
     print(
         f"After step 2 - Failure count: {backend.op_manager.get_failure_count()}, "
@@ -873,14 +917,14 @@ def reset_file_threshold_recovery_test(backend: WekaGdsBackend):
             # Use any key
             test_key_for_reset = create_test_key(chunk_hash=9999)
             try:
-                result = backend.contains(test_key_for_reset, False)
-                print(f"Contains operation succeeded, result: {result}")
+                contains_result = backend.contains(test_key_for_reset, False)
+                print(f"Contains operation succeeded, result: {contains_result}")
                 operation_succeeded = True
             except Exception as e:
                 print(
                     f"Contains operation failed with exception: {type(e).__name__}: {e}"
                 )
-                result = False
+                contains_result = False
                 operation_succeeded = False
 
         # Check status after the operation
@@ -923,8 +967,10 @@ def reset_file_threshold_recovery_test(backend: WekaGdsBackend):
         with unittest.mock.patch.object(
             backend, "_try_to_read_metadata", side_effect=normal_try_to_read_metadata
         ):
-            result = backend.contains(k3, False)
-            assert result is False  # Normal mock response, but no threshold exception
+            contains_result = backend.contains(k3, False)
+            assert (
+                contains_result is False
+            )  # Normal mock response, but no threshold exception
 
 
 def test_reset_file_threshold_recovery():
