@@ -975,3 +975,217 @@ def reset_file_threshold_recovery_test(backend: WekaGdsBackend):
 
 def test_reset_file_threshold_recovery():
     init_and_teardown(reset_file_threshold_recovery_test)
+
+
+def batched_async_contains_basic_test(backend: WekaGdsBackend):
+    """Test batched_async_contains with 5 keys stored, all should be found."""
+    # Create 5 test keys
+    keys = []
+    for i, chunk_hash in enumerate(
+        [0xDEADBEEF, 0xCAFEBABE, 0xBADB0E, 0xFEEDFACE, 0xDEADC0DE]
+    ):
+        keys.append(create_test_key(chunk_hash=chunk_hash))
+
+    # Store all 5 keys
+    memory_objs = [create_test_memory_obj(backend) for _ in range(len(keys))]
+    backend.batched_submit_put_task(keys, memory_objs)
+
+    # Wait for all put tasks to complete
+    def wait_for_put_tasks_completion():
+        # Standard
+        import time
+
+        timeout = 30.0
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            all_completed = True
+            for key in keys:
+                if backend.exists_in_put_tasks(key):
+                    all_completed = False
+                    break
+            if all_completed:
+                return
+            time.sleep(0.1)
+        raise TimeoutError("Put tasks did not complete within timeout")
+
+    wait_for_put_tasks_completion()
+
+    # Verify all keys are stored using regular contains()
+    for key in keys:
+        assert backend.contains(key, False), f"Key {key} should be in backend"
+
+    # Test batched_async_contains - should find all 5 keys
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        result = loop.run_until_complete(
+            backend.batched_async_contains("test_lookup", keys, pin=False)
+        )
+        assert result == 5, f"Expected 5 hits, got {result}"
+    finally:
+        loop.close()
+
+
+def batched_async_contains_partial_test(backend: WekaGdsBackend):
+    """Test batched_async_contains where the 3rd key doesn't exist, should return 2."""
+    # Create 5 test keys
+    keys = []
+    for i, chunk_hash in enumerate(
+        [0xDEADBEEF, 0xCAFEBABE, 0xBADB0E, 0xFEEDFACE, 0xDEADC0DE]
+    ):
+        keys.append(create_test_key(chunk_hash=chunk_hash))
+
+    # Store only keys[0], keys[1], keys[3], keys[4] (skip keys[2])
+    keys_to_store = [keys[0], keys[1], keys[3], keys[4]]
+    memory_objs = [create_test_memory_obj(backend) for _ in range(len(keys_to_store))]
+    backend.batched_submit_put_task(keys_to_store, memory_objs)
+
+    # Wait for put tasks to complete
+    def wait_for_put_tasks_completion():
+        # Standard
+        import time
+
+        timeout = 30.0
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            all_completed = True
+            for key in keys_to_store:
+                if backend.exists_in_put_tasks(key):
+                    all_completed = False
+                    break
+            if all_completed:
+                return
+            time.sleep(0.1)
+        raise TimeoutError("Put tasks did not complete within timeout")
+
+    wait_for_put_tasks_completion()
+
+    # Verify stored keys exist and missing key doesn't
+    assert backend.contains(keys[0], False), "Key 0 should exist"
+    assert backend.contains(keys[1], False), "Key 1 should exist"
+    assert not backend.contains(keys[2], False), "Key 2 should not exist"
+    assert backend.contains(keys[3], False), "Key 3 should exist"
+    assert backend.contains(keys[4], False), "Key 4 should exist"
+
+    # Test batched_async_contains - should return 2 (stops at missing keys[2])
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        result = loop.run_until_complete(
+            backend.batched_async_contains("test_lookup", keys, pin=False)
+        )
+        assert result == 2, f"Expected 2 hits (stops at missing key[2]), got {result}"
+    finally:
+        loop.close()
+
+
+def batched_async_contains_mixed_cache_test(backend: WekaGdsBackend):
+    """Test batched_async_contains with mixed hot_cache and disk lookup scenarios."""
+    # Create 5 test keys: A, B, C, D, E
+    key_a = create_test_key(chunk_hash=0xAAAAAAAA)
+    key_b = create_test_key(chunk_hash=0xBBBBBBBB)
+    key_c = create_test_key(chunk_hash=0xCCCCCCCC)
+    key_d = create_test_key(chunk_hash=0xDDDDDDDD)
+    key_e = create_test_key(chunk_hash=0xEEEEEEEE)
+
+    # Step 1: Store keys A and B
+    keys_ab = [key_a, key_b]
+    memory_objs_ab = [create_test_memory_obj(backend) for _ in range(2)]
+    backend.batched_submit_put_task(keys_ab, memory_objs_ab)
+
+    def wait_for_put_tasks(keys_to_wait):
+        # Standard
+        import time
+
+        timeout = 30.0
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            all_completed = True
+            for key in keys_to_wait:
+                if backend.exists_in_put_tasks(key):
+                    all_completed = False
+                    break
+            if all_completed:
+                return
+            time.sleep(0.1)
+        raise TimeoutError("Put tasks did not complete within timeout")
+
+    wait_for_put_tasks(keys_ab)
+
+    # Step 2: Clear hot_cache to force disk lookup for A and B
+    with backend.hot_lock:
+        backend.hot_cache.clear()
+        # Also clear metadata dirs to simulate clean state
+        backend.metadata_dirs.clear()
+
+    # Step 3: Store keys C, D, E (these will be in hot_cache)
+    keys_cde = [key_c, key_d, key_e]
+    memory_objs_cde = [create_test_memory_obj(backend) for _ in range(3)]
+    backend.batched_submit_put_task(keys_cde, memory_objs_cde)
+
+    wait_for_put_tasks(keys_cde)
+
+    # Verify state: C, D, E should be in hot_cache; A, B should require disk lookup
+    with backend.hot_lock:
+        assert key_c in backend.hot_cache, "Key C should be in hot_cache"
+        assert key_d in backend.hot_cache, "Key D should be in hot_cache"
+        assert key_e in backend.hot_cache, "Key E should be in hot_cache"
+        assert key_a not in backend.hot_cache, "Key A should not be in hot_cache"
+        assert key_b not in backend.hot_cache, "Key B should not be in hot_cache"
+
+    # Verify all keys exist via regular contains() (this will populate hot_cache)
+    assert backend.contains(key_a, False), "Key A should exist on disk"
+    assert backend.contains(key_b, False), "Key B should exist on disk"
+    assert backend.contains(key_c, False), "Key C should exist"
+    assert backend.contains(key_d, False), "Key D should exist"
+    assert backend.contains(key_e, False), "Key E should exist"
+
+    # Clear hot_cache again to ensure we test the mixed scenario
+    with backend.hot_lock:
+        backend.hot_cache.clear()
+        backend.metadata_dirs.clear()
+
+    # Re-add C, D, E to hot_cache by storing them again
+    backend.batched_submit_put_task(
+        keys_cde, [create_test_memory_obj(backend) for _ in range(3)]
+    )
+    wait_for_put_tasks(keys_cde)
+
+    # Step 4: Test batched_async_contains with [C, A, D, B, E]
+    # Expected behavior:
+    # - C: found in hot_cache (hit 1)
+    # - A: not in hot_cache, found on disk (hit 2)
+    # - D: found in hot_cache (hit 3)
+    # - B: not in hot_cache, found on disk (hit 4)
+    # - E: found in hot_cache (hit 5)
+    test_keys = [key_c, key_a, key_d, key_b, key_e]
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        result = loop.run_until_complete(
+            backend.batched_async_contains("test_lookup", test_keys, pin=False)
+        )
+        assert result == 5, (
+            f"Expected 5 hits with mixed cache/disk lookup, got {result}"
+        )
+    finally:
+        loop.close()
+
+
+def test_batched_async_contains_basic():
+    """Test basic batched_async_contains functionality with all keys present."""
+    init_and_teardown(batched_async_contains_basic_test)
+
+
+def test_batched_async_contains_partial():
+    """Test batched_async_contains stops at first missing key."""
+    init_and_teardown(batched_async_contains_partial_test)
+
+
+def test_batched_async_contains_mixed_cache():
+    """Test batched_async_contains with mixed hot_cache and disk scenarios."""
+    init_and_teardown(batched_async_contains_mixed_cache_test)
