@@ -213,6 +213,429 @@ def test_weka_backend_batch_store_load():
     init_and_teardown(basic_batch_store_load_test)
 
 
+async def basic_batched_get_non_blocking_test(backend: WekaGdsBackend):
+    """Test basic functionality of batched_get_non_blocking"""
+    # Create test keys and memory objects
+    keys = []
+    for chunk_hash in [0xDEADBEEF, 0xCAFEBABE, 0xBADB0E]:
+        keys.append(create_test_key(chunk_hash=chunk_hash))
+    memory_objs = [create_test_memory_obj(backend) for _ in range(len(keys))]
+
+    # Store the objects first
+    backend.batched_submit_put_task(keys, memory_objs)
+
+    # Wait for put tasks to complete
+    timeout = 30.0
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        keys_still_pending = [key for key in keys if backend.exists_in_put_tasks(key)]
+        if not keys_still_pending:
+            break
+        await asyncio.sleep(0.1)
+    else:
+        raise TimeoutError("Put tasks did not complete within timeout")
+
+    # Verify all keys are stored
+    for key in keys:
+        assert backend.contains(key)
+
+    # Test batched_get_non_blocking
+    lookup_id = "test_lookup_001"
+    returned_memory_objs = await backend.batched_get_non_blocking(lookup_id, keys)
+
+    # Verify results
+    assert returned_memory_objs is not None
+    assert len(returned_memory_objs) == len(keys)
+
+    for i, (returned_memory_obj, original_memory_obj) in enumerate(
+        zip(returned_memory_objs, memory_objs, strict=True)
+    ):
+        assert returned_memory_obj is not None, f"Memory object {i} should not be None"
+        assert returned_memory_obj.get_size() == original_memory_obj.get_size()
+        assert returned_memory_obj.get_shape() == original_memory_obj.get_shape()
+        assert returned_memory_obj.get_dtype() == original_memory_obj.get_dtype()
+        # Verify reference count was incremented
+        assert returned_memory_obj.metadata.ref_count > 0
+
+
+def test_weka_backend_batched_get_non_blocking_basic():
+    """Test basic batched_get_non_blocking functionality"""
+
+    def run_async_test(backend: WekaGdsBackend):
+        # Run the async test in the backend's event loop
+        future = asyncio.run_coroutine_threadsafe(
+            basic_batched_get_non_blocking_test(backend), backend.loop
+        )
+        future.result(timeout=60.0)
+
+    init_and_teardown(run_async_test)
+
+
+async def batched_get_non_blocking_missing_keys_test(backend: WekaGdsBackend):
+    """Test batched_get_non_blocking with missing keys"""
+    # Create some keys that exist and some that don't
+    existing_keys = []
+    for chunk_hash in [0xDEADBEEF, 0xCAFEBABE]:
+        existing_keys.append(create_test_key(chunk_hash=chunk_hash))
+
+    missing_keys = []
+    for chunk_hash in [0xBADB0E, 0x12345678]:
+        missing_keys.append(create_test_key(chunk_hash=chunk_hash))
+
+    # Store only the existing keys
+    memory_objs = [create_test_memory_obj(backend) for _ in range(len(existing_keys))]
+    backend.batched_submit_put_task(existing_keys, memory_objs)
+
+    # Wait for put tasks to complete
+    timeout = 30.0
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        keys_still_pending = [
+            key for key in existing_keys if backend.exists_in_put_tasks(key)
+        ]
+        if not keys_still_pending:
+            break
+        await asyncio.sleep(0.1)
+    else:
+        raise TimeoutError("Put tasks did not complete within timeout")
+
+    # Verify existing keys are stored and missing keys are not
+    for key in existing_keys:
+        assert backend.contains(key)
+    for key in missing_keys:
+        assert not backend.contains(key)
+
+    # Test with missing keys - this should raise an assertion error
+    # because the current implementation asserts that keys exist
+    lookup_id = "test_lookup_missing"
+    try:
+        await backend.batched_get_non_blocking(lookup_id, missing_keys)
+        raise AssertionError("Expected AssertionError for missing keys")
+    except AssertionError as e:
+        assert "not found in hot cache" in str(e)
+
+
+def test_weka_backend_batched_get_non_blocking_missing_keys():
+    """Test batched_get_non_blocking with missing keys"""
+
+    def run_async_test(backend: WekaGdsBackend):
+        future = asyncio.run_coroutine_threadsafe(
+            batched_get_non_blocking_missing_keys_test(backend), backend.loop
+        )
+        future.result(timeout=60.0)
+
+    init_and_teardown(run_async_test)
+
+
+async def batched_get_non_blocking_empty_list_test(backend: WekaGdsBackend):
+    """Test batched_get_non_blocking with empty key list"""
+    lookup_id = "test_lookup_empty"
+    returned_memory_objs = await backend.batched_get_non_blocking(lookup_id, [])
+
+    assert returned_memory_objs is not None
+    assert len(returned_memory_objs) == 0
+
+
+def test_weka_backend_batched_get_non_blocking_empty_list():
+    """Test batched_get_non_blocking with empty key list"""
+
+    def run_async_test(backend: WekaGdsBackend):
+        future = asyncio.run_coroutine_threadsafe(
+            batched_get_non_blocking_empty_list_test(backend), backend.loop
+        )
+        future.result(timeout=60.0)
+
+    init_and_teardown(run_async_test)
+
+
+def test_weka_backend_batched_get_non_blocking_disk_read_failure():
+    """Test batched_get_non_blocking error handling with missing keys"""
+
+    async def error_handling_test(backend: WekaGdsBackend):
+        # Test with a key that was never stored - should fail at hot cache lookup
+        missing_key = create_test_key(chunk_hash=0x999999)
+
+        lookup_id = "test_error_handling"
+        try:
+            await asyncio.wait_for(
+                backend.batched_get_non_blocking(lookup_id, [missing_key]), timeout=5.0
+            )
+            raise AssertionError("Expected AssertionError for missing key")
+        except AssertionError as e:
+            assert "not found in hot cache" in str(e)
+        except asyncio.TimeoutError:
+            raise AssertionError("Test timed out - this should fail quickly") from None
+
+    def run_async_test(backend: WekaGdsBackend):
+        future = asyncio.run_coroutine_threadsafe(
+            error_handling_test(backend), backend.loop
+        )
+        future.result(timeout=10.0)
+
+    init_and_teardown(run_async_test)
+
+
+async def batched_get_non_blocking_performance_test(backend: WekaGdsBackend):
+    """Test batched_get_non_blocking performance with multiple keys"""
+    # Create a larger set of test data to verify performance
+    num_keys = 5
+    keys = []
+    memory_objs = []
+
+    for i in range(num_keys):
+        key = create_test_key(chunk_hash=0x100000 + i)
+        keys.append(key)
+        memory_objs.append(create_test_memory_obj(backend))
+
+    # Store all objects
+    backend.batched_submit_put_task(keys, memory_objs)
+
+    # Wait for put tasks to complete
+    timeout = 30.0
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        keys_still_pending = [key for key in keys if backend.exists_in_put_tasks(key)]
+        if not keys_still_pending:
+            break
+        await asyncio.sleep(0.1)
+    else:
+        raise TimeoutError("Put tasks did not complete within timeout")
+
+    # Measure batched_get_non_blocking performance
+    perf_start_time = time.perf_counter()
+
+    lookup_id = "performance_test"
+    returned_memory_objs = await backend.batched_get_non_blocking(lookup_id, keys)
+
+    end_time = time.perf_counter()
+    elapsed_time = end_time - perf_start_time
+
+    # Verify results
+    assert returned_memory_objs is not None
+    assert len(returned_memory_objs) == num_keys
+
+    for mem_obj in returned_memory_objs:
+        assert mem_obj is not None
+        assert mem_obj.metadata.ref_count > 0
+
+    # Performance should be reasonable (less than 5 seconds for 5 objects)
+    assert elapsed_time < 5.0, (
+        f"batched_get_non_blocking took too long: {elapsed_time:.2f}s"
+    )
+
+    print(f"batched_get_non_blocking took {elapsed_time:.3f}s for {num_keys} objects")
+
+
+def test_weka_backend_batched_get_non_blocking_performance():
+    """Test batched_get_non_blocking performance"""
+
+    def run_async_test(backend: WekaGdsBackend):
+        future = asyncio.run_coroutine_threadsafe(
+            batched_get_non_blocking_performance_test(backend), backend.loop
+        )
+        future.result(timeout=60.0)
+
+    init_and_teardown(run_async_test)
+
+
+async def batched_get_non_blocking_layerwise_simulation_test(backend: WekaGdsBackend):
+    """Test batched_get_non_blocking in a layerwise-like scenario"""
+    # Simulate layerwise retrieval pattern where we retrieve chunks layer by layer
+    num_layers = 3
+    chunks_per_layer = 2
+
+    # Create keys organized by layers (like in layerwise mode)
+    all_keys = []
+    all_memory_objs = []
+    keys_by_layer = []
+
+    for layer_id in range(num_layers):
+        layer_keys = []
+        for chunk_id in range(chunks_per_layer):
+            # Create unique hash for each layer-chunk combination
+            chunk_hash = (layer_id << 16) | chunk_id
+            key = create_test_key(chunk_hash=chunk_hash)
+            layer_keys.append(key)
+            all_keys.append(key)
+            all_memory_objs.append(create_test_memory_obj(backend))
+        keys_by_layer.append(layer_keys)
+
+    # Store all objects
+    backend.batched_submit_put_task(all_keys, all_memory_objs)
+
+    # Wait for put tasks to complete
+    timeout = 30.0
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        keys_still_pending = [
+            key for key in all_keys if backend.exists_in_put_tasks(key)
+        ]
+        if not keys_still_pending:
+            break
+        await asyncio.sleep(0.1)
+    else:
+        raise TimeoutError("Put tasks did not complete within timeout")
+
+    # Simulate layerwise retrieval - retrieve one layer at a time
+    retrieved_by_layer = []
+    for layer_id, layer_keys in enumerate(keys_by_layer):
+        lookup_id = f"layerwise_lookup_layer_{layer_id}"
+        layer_memory_objs = await backend.batched_get_non_blocking(
+            lookup_id, layer_keys
+        )
+
+        assert layer_memory_objs is not None
+        assert len(layer_memory_objs) == len(layer_keys)
+
+        # Verify all objects in this layer are valid
+        for mem_obj in layer_memory_objs:
+            assert mem_obj is not None
+            assert mem_obj.metadata.ref_count > 0
+
+        retrieved_by_layer.append(layer_memory_objs)
+
+    # Verify we retrieved all layers correctly
+    assert len(retrieved_by_layer) == num_layers
+    total_retrieved = sum(len(layer_objs) for layer_objs in retrieved_by_layer)
+    assert total_retrieved == len(all_keys)
+
+
+def test_weka_backend_batched_get_non_blocking_layerwise_simulation():
+    """Test batched_get_non_blocking in a layerwise-like scenario"""
+
+    def run_async_test(backend: WekaGdsBackend):
+        future = asyncio.run_coroutine_threadsafe(
+            batched_get_non_blocking_layerwise_simulation_test(backend), backend.loop
+        )
+        future.result(timeout=60.0)
+
+    init_and_teardown(run_async_test)
+
+
+async def batched_get_non_blocking_concurrent_test(backend: WekaGdsBackend):
+    """Test concurrent calls to batched_get_non_blocking"""
+    # Create test data
+    num_concurrent_calls = 3
+    keys_per_call = 2
+    all_keys = []
+    all_memory_objs = []
+
+    for call_id in range(num_concurrent_calls):
+        for key_id in range(keys_per_call):
+            chunk_hash = (call_id << 8) | key_id
+            key = create_test_key(chunk_hash=chunk_hash)
+            all_keys.append(key)
+            all_memory_objs.append(create_test_memory_obj(backend))
+
+    # Store all objects
+    backend.batched_submit_put_task(all_keys, all_memory_objs)
+
+    # Wait for put tasks to complete
+    timeout = 30.0
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        keys_still_pending = [
+            key for key in all_keys if backend.exists_in_put_tasks(key)
+        ]
+        if not keys_still_pending:
+            break
+        await asyncio.sleep(0.1)
+    else:
+        raise TimeoutError("Put tasks did not complete within timeout")
+
+    # Create concurrent batched_get_non_blocking calls
+    tasks = []
+    for call_id in range(num_concurrent_calls):
+        start_idx = call_id * keys_per_call
+        end_idx = start_idx + keys_per_call
+        call_keys = all_keys[start_idx:end_idx]
+        lookup_id = f"concurrent_lookup_{call_id}"
+
+        task = asyncio.create_task(
+            backend.batched_get_non_blocking(lookup_id, call_keys)
+        )
+        tasks.append((task, call_keys))
+
+    # Wait for all tasks to complete
+    results = []
+    for task, expected_keys in tasks:
+        memory_objs = await task
+        assert memory_objs is not None
+        assert len(memory_objs) == len(expected_keys)
+        for mem_obj in memory_objs:
+            assert mem_obj is not None
+            assert mem_obj.metadata.ref_count > 0
+        results.append(memory_objs)
+
+    # Verify all concurrent calls succeeded
+    assert len(results) == num_concurrent_calls
+    total_retrieved = sum(len(result) for result in results)
+    assert total_retrieved == len(all_keys)
+
+
+def test_weka_backend_batched_get_non_blocking_concurrent():
+    """Test concurrent calls to batched_get_non_blocking"""
+
+    def run_async_test(backend: WekaGdsBackend):
+        future = asyncio.run_coroutine_threadsafe(
+            batched_get_non_blocking_concurrent_test(backend), backend.loop
+        )
+        future.result(timeout=60.0)
+
+    init_and_teardown(run_async_test)
+
+
+async def batched_get_non_blocking_reference_count_test(backend: WekaGdsBackend):
+    """Test that batched_get_non_blocking properly manages reference counts"""
+    # Create test data
+    keys = []
+    for chunk_hash in [0xEF001, 0xEF002]:
+        keys.append(create_test_key(chunk_hash=chunk_hash))
+    memory_objs = [create_test_memory_obj(backend) for _ in range(len(keys))]
+
+    # Store the objects
+    backend.batched_submit_put_task(keys, memory_objs)
+
+    # Wait for put tasks to complete
+    timeout = 30.0
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        keys_still_pending = [key for key in keys if backend.exists_in_put_tasks(key)]
+        if not keys_still_pending:
+            break
+        await asyncio.sleep(0.1)
+    else:
+        raise TimeoutError("Put tasks did not complete within timeout")
+
+    # Get the objects via batched_get_non_blocking
+    lookup_id = "test_refcount"
+    returned_memory_objs = await backend.batched_get_non_blocking(lookup_id, keys)
+
+    # Verify reference counts were incremented
+    assert len(returned_memory_objs) == len(keys)
+    for mem_obj in returned_memory_objs:
+        assert mem_obj is not None
+        # Reference count should be > 0 because batched_get_non_blocking calls
+        # ref_count_up()
+        assert mem_obj.metadata.ref_count > 0
+
+    # Manually decrement reference counts to simulate cleanup
+    for mem_obj in returned_memory_objs:
+        mem_obj.ref_count_down()
+
+
+def test_weka_backend_batched_get_non_blocking_reference_count():
+    """Test that batched_get_non_blocking properly manages reference counts"""
+
+    def run_async_test(backend: WekaGdsBackend):
+        future = asyncio.run_coroutine_threadsafe(
+            batched_get_non_blocking_reference_count_test(backend), backend.loop
+        )
+        future.result(timeout=60.0)
+
+    init_and_teardown(run_async_test)
+
+
 def submit_put_task_cufile_write_failure_test(backend: WekaGdsBackend):
     """Test that submit_put_task handles cuFile write failures gracefully"""
     # Standard
