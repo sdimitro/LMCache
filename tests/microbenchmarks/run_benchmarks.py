@@ -30,6 +30,9 @@ Examples:
   %(prog)s --scaling                 # Just scaling analysis
   %(prog)s --custom --runs 20        # Custom configuration
   %(prog)s --save-results            # Save results to JSON files
+  %(prog)s --retrieve-quick          # Quick retrieve() profiling benchmark
+  %(prog)s --retrieve-profiling      # Comprehensive retrieve() profiling
+  %(prog)s --weka-retrieve-base      # Weka retrieve profiling (256 chunk, 131k tokens)
         """,
     )
 
@@ -53,6 +56,22 @@ Examples:
     )
     preset_group.add_argument(
         "--custom", action="store_true", help="Run custom benchmark configuration"
+    )
+    preset_group.add_argument(
+        "--retrieve-profiling",
+        action="store_true",
+        help="Run LMCache retrieve() method profiling benchmarks",
+    )
+    preset_group.add_argument(
+        "--retrieve-quick",
+        action="store_true",
+        help="Run quick retrieve() profiling benchmark for development",
+    )
+    preset_group.add_argument(
+        "--weka-retrieve-base",
+        action="store_true",
+        help="Run Weka retrieve() profiling benchmark with base configuration "
+        "(256 chunk, 131072 tokens, 8 layers, 32 GDS threads)",
     )
 
     # Custom options
@@ -144,6 +163,48 @@ Examples:
         )
         cmd.extend(["-m", "benchmark"])
         print("Running SINGLE vs BATCHED comparison")
+
+    elif args.retrieve_profiling:
+        cmd.append(
+            str(
+                benchmark_dir / "test_lmcache_retrieve_profiling.py"
+                "::test_comprehensive_retrieve_benchmark"
+            )
+        )
+        cmd.extend(["-m", "benchmark"])
+        print("Running RETRIEVE PROFILING comprehensive benchmark")
+
+    elif args.retrieve_quick:
+        cmd.append(
+            str(
+                benchmark_dir
+                / "test_lmcache_retrieve_profiling.py::test_quick_retrieve_benchmark"
+            )
+        )
+        print("Running QUICK RETRIEVE PROFILING benchmark (development mode)")
+
+    elif args.weka_retrieve_base:
+        # Run the standalone script directly with the specific configuration
+        cmd = [
+            "python",
+            str(benchmark_dir / "test_lmcache_retrieve_profiling.py"),
+            "--use-weka",
+            "--enable-profiling",
+            "--chunk-sizes",
+            "256",
+            "--token-counts",
+            "131072",
+            "--iterations",
+            "100",
+            "--num-layers",
+            "8",
+            "--gds-io-threads",
+            "32",
+        ]
+        print(
+            "Running WEKA RETRIEVE BASE profiling benchmark "
+            "(256 chunk, 131072 tokens, 8 layers, 32 GDS threads)"
+        )
 
     elif args.custom:
         cmd.extend(["-m", "benchmark and not slow"])
