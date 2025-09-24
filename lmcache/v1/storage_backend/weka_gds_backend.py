@@ -660,13 +660,19 @@ class WekaGdsBackend(StorageBackendInterface):
                 dtypes.append(entry.dtype)
                 shapes.append(entry.shape)
 
+        fmt = None
+        if self.layerwise:
+            fmt = MemoryFormat.KV_T2D
+        else:
+            fmt = MemoryFormat.KV_2LTD
+
         memory_objs: list[MemoryObj | None] = []
         gds_reads, gds_read_bytes = 0, 0
         for dtype, shape, path in zip(dtypes, shapes, paths, strict=True):
             if path is None:
                 memory_objs.append(None)
                 continue
-            memory_obj = self.memory_allocator.allocate(shape, dtype)
+            memory_obj = self.memory_allocator.allocate(shape, dtype, fmt)
             if memory_obj is None:
                 logger.error(f"Memory allocation failed during get_blocking for {path}")
             else:
@@ -682,10 +688,20 @@ class WekaGdsBackend(StorageBackendInterface):
         )
         total_time = time.perf_counter() - start_time
         logger.info(
-            f"Time taken for batched_get_blocking: {total_time:.3f}s |"
+            f"Time taken for batched_get: {total_time:.3f}s |"
             f" {gds_read_bytes / 1024 / 1024}MiB | {gds_reads} ops."
         )
         return results
+
+    async def _async_batched_get_blocking(
+        self,
+        keys: List[CacheEngineKey],
+    ) -> list[MemoryObj | None]:
+        """
+        Asynchronously run the batched get operation in a thread pool.
+        This allows the event loop to handle other operations while I/O is happening.
+        """
+        return await asyncio.to_thread(self._batched_get_blocking, keys)
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -770,6 +786,14 @@ class WekaGdsBackend(StorageBackendInterface):
             )
         return False
 
+    async def _async_contains_slow_path(self, key: CacheEngineKey) -> bool:
+        """
+        Asynchronously check if a key exists using the slow path (FS I/O).
+        This runs the blocking operation in a thread pool to avoid blocking
+        the event loop.
+        """
+        return await asyncio.to_thread(self._contains_slow_path, key)
+
     async def batched_async_contains(
         self,
         lookup_id: str,
@@ -802,9 +826,9 @@ class WekaGdsBackend(StorageBackendInterface):
             if num_hit_chunks == len(keys):
                 return num_hit_chunks
 
-            # Check the current key that's not in hot cache using slow path
+            # Check the current key that's not in hot cache using async slow path
             current_key = keys[num_hit_chunks]
-            if self._contains_slow_path(current_key):
+            if await self._async_contains_slow_path(current_key):
                 num_hit_chunks += 1
             else:
                 return num_hit_chunks
@@ -823,51 +847,7 @@ class WekaGdsBackend(StorageBackendInterface):
         :param keys: The keys to retrieve
         :return: List of MemoryObj instances
         """
-        mem_objs: list[MemoryObj] = []
-        entries: list[DiskCacheMetadata] = []
-
-        # TODO(Serapheim): Do this properly
-        start_time = time.perf_counter()
-        # First, collect metadata for all keys
-        with self.hot_lock:
-            for key in keys:
-                entry = self.hot_cache.get(key)
-                assert entry is not None, f"Key {key} not found in hot cache"
-                entries.append(entry)
-        hot_cache_done_time = time.perf_counter()
-
-        # Load memory objects for each key
-        gds_reads = 0
-        gds_read_bytes = 0
-        for key, entry in zip(keys, entries, strict=True):
-            assert entry is not None, f"Key {key} not found in hot cache"
-            try:
-                memory_obj = await self._async_load_bytes_from_disk(
-                    key, entry.path, entry.dtype, entry.shape
-                )
-                if memory_obj is not None:
-                    gds_reads += 1
-                    gds_read_bytes += memory_obj.get_size()
-                    # TODO(Serapheim): check if this is correct,
-                    #  if not needed fix benchmark code
-                    memory_obj.ref_count_up()
-                    mem_objs.append(memory_obj)
-            except Exception as e:
-                logger.error(
-                    f"Failed to load memory object for key {key}: {e}",
-                    exc_info=True,
-                )
-        gds_done_time = time.perf_counter()
-
-        total_time = gds_done_time - start_time
-        logger.info(
-            f"Time taken for batched_get_non_blocking: {total_time:.3f}s |"
-            f" Hot cache time: {hot_cache_done_time - start_time:.3f}s |"
-            f" GDS time: {gds_done_time - hot_cache_done_time:.3f}s |"
-            f" {gds_read_bytes / 1024 / 1024}MiB | {gds_reads} ops."
-        )
-
-        return mem_objs
+        return await self._async_batched_get_blocking(keys)  # type: ignore[return-value]
 
     def close(self) -> None:
         self.op_manager.shutdown()

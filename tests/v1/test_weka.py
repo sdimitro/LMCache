@@ -305,14 +305,12 @@ async def batched_get_non_blocking_missing_keys_test(backend: WekaGdsBackend):
     for key in missing_keys:
         assert not backend.contains(key)
 
-    # Test with missing keys - this should raise an assertion error
-    # because the current implementation asserts that keys exist
+    # Test with missing keys - should return [None] for each missing key
     lookup_id = "test_lookup_missing"
-    try:
-        await backend.batched_get_non_blocking(lookup_id, missing_keys)
-        raise AssertionError("Expected AssertionError for missing keys")
-    except AssertionError as e:
-        assert "not found in hot cache" in str(e)
+    result = await backend.batched_get_non_blocking(lookup_id, missing_keys)
+    assert result is not None
+    assert len(result) == len(missing_keys)
+    assert all(obj is None for obj in result)
 
 
 def test_weka_backend_batched_get_non_blocking_missing_keys():
@@ -356,15 +354,12 @@ def test_weka_backend_batched_get_non_blocking_disk_read_failure():
         missing_key = create_test_key(chunk_hash=0x999999)
 
         lookup_id = "test_error_handling"
-        try:
-            await asyncio.wait_for(
-                backend.batched_get_non_blocking(lookup_id, [missing_key]), timeout=5.0
-            )
-            raise AssertionError("Expected AssertionError for missing key")
-        except AssertionError as e:
-            assert "not found in hot cache" in str(e)
-        except asyncio.TimeoutError:
-            raise AssertionError("Test timed out - this should fail quickly") from None
+        result = await asyncio.wait_for(
+            backend.batched_get_non_blocking(lookup_id, [missing_key]), timeout=5.0
+        )
+        assert result is not None
+        assert len(result) == 1
+        assert result[0] is None
 
     def run_async_test(backend: WekaGdsBackend):
         future = asyncio.run_coroutine_threadsafe(
