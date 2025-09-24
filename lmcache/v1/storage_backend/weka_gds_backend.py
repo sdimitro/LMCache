@@ -19,9 +19,18 @@ import torch
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey, DiskCacheMetadata, _lmcache_nvtx_annotate
+from lmcache.utils import (
+    CacheEngineKey,
+    DiskCacheMetadata,
+    LayerCacheEngineKey,
+    _lmcache_nvtx_annotate,
+)
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.memory_management import MemoryAllocatorInterface, MemoryObj
+from lmcache.v1.memory_management import (
+    MemoryAllocatorInterface,
+    MemoryFormat,
+    MemoryObj,
+)
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
 
 logger = init_logger(__name__)
@@ -213,7 +222,7 @@ class WekaGdsBackend(StorageBackendInterface):
         assert dst_device.startswith("cuda")
         super().__init__(dst_device)
 
-        self.config = config
+        self.layerwise = config.use_layerwise
         self.loop = loop
         self.memory_allocator = memory_allocator
         self.dst_device = dst_device
@@ -298,7 +307,10 @@ class WekaGdsBackend(StorageBackendInterface):
                         filename = os.path.basename(fentry.name)
                         key_str = filename[: -len(target_suffix)].replace("_", "/")
                         try:
-                            key = CacheEngineKey.from_string(key_str)
+                            if self.layerwise:
+                                key = LayerCacheEngineKey.from_string(key_str)
+                            else:
+                                key = CacheEngineKey.from_string(key_str)
                         except ValueError as e:
                             logger.error(
                                 f"Filename {filename} can't be converted "
@@ -317,8 +329,15 @@ class WekaGdsBackend(StorageBackendInterface):
         with open(filename, "rb") as f:
             buf = f.read(_METADATA_MAX_SIZE)
         shape, dtype, size = unpack_metadata(buf)
+        # Set the appropriate memory format for layerwise operations
+        fmt = None
+        if self.layerwise:
+            fmt = MemoryFormat.KV_T2D
+        else:
+            fmt = MemoryFormat.KV_2LTD
+
         metadata = DiskCacheMetadata(
-            filename.removesuffix(_METADATA_FILE_SUFFIX), size, shape, dtype
+            filename.removesuffix(_METADATA_FILE_SUFFIX), size, shape, dtype, fmt
         )
         with self.hot_lock:
             self.metadata_dirs.add(subdir_key)
@@ -580,7 +599,13 @@ class WekaGdsBackend(StorageBackendInterface):
             A new memory object with loaded data, or None if allocation or
             loading failed
         """
-        memory_obj = self.memory_allocator.allocate(shape, dtype)
+        fmt = None
+        if self.layerwise:
+            fmt = MemoryFormat.KV_T2D
+        else:
+            fmt = MemoryFormat.KV_2LTD
+
+        memory_obj = self.memory_allocator.allocate(shape, dtype, fmt)
         if memory_obj is None:
             logger.error("Memory allocation failed during sync disk load.")
             return None

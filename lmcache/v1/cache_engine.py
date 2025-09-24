@@ -571,6 +571,9 @@ class LMCacheEngine:
         ends = []
         keys = []
 
+        # TODO(Serapheim): Allow for multiple locations
+        location = None
+
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
@@ -584,7 +587,9 @@ class LMCacheEngine:
             keys_multi_layer = key.split_layers(self.num_layers)
 
             # NOTE: Only check the first layer
-            if not self.storage_manager.contains(keys_multi_layer[0]):
+            # TODO(Serapheim): Allow for multiple locations
+            location = self.storage_manager.contains(keys_multi_layer[0])
+            if not location:
                 break
 
             starts.append(start)
@@ -597,7 +602,10 @@ class LMCacheEngine:
             # Transpose the keys into layer major format
             keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
 
-            get_generator = self.storage_manager.layerwise_batched_get(keys_layer_major)
+            # TODO(Serapheim): Allow for multiple locations
+            get_generator = self.storage_manager.layerwise_batched_get(
+                keys_layer_major, location
+            )
 
             assert isinstance(
                 self.gpu_connector,
