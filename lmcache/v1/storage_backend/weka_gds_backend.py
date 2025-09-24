@@ -481,7 +481,7 @@ class WekaGdsBackend(StorageBackendInterface):
 
     def insert_key(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
         path, _, _, _ = self._key_to_path(key)
-        size = memory_obj.get_physical_size()
+        size = memory_obj.get_size()  # Use logical size to match what's stored in file
         shape = memory_obj.metadata.shape
         dtype = memory_obj.metadata.dtype
         with self.hot_lock:
@@ -553,15 +553,17 @@ class WekaGdsBackend(StorageBackendInterface):
             return None
         assert memory_obj.tensor.is_cuda
         assert torch.device(self.dst_device) == torch.device(memory_obj.tensor.device)
-        # TODO(Jiayi): We can optimize a bit by reading size instead of physical size.
+        # Read logical size instead of physical size since
+        # we only store logical size in file
+        logical_size = memory_obj.get_size()
         ret = self._load_gds_cufile(
             path,
             _METADATA_MAX_SIZE,
             ctypes.c_void_p(self.cufile_base_pointer),
-            memory_obj.get_physical_size(),
+            logical_size,
             memory_obj.metadata.address,
         )
-        if ret != memory_obj.get_physical_size():
+        if ret != logical_size:
             if ret < 0:
                 logger.error(
                     f"Error loading {path}: ret: {ret} removing entry from cache"
@@ -573,7 +575,7 @@ class WekaGdsBackend(StorageBackendInterface):
                 # remove the entry if it's a persistent problem.
                 logger.error(
                     f"Error loading {path}: got only {ret} bytes "
-                    f"out of {memory_obj.get_physical_size()}, ignoring"
+                    f"out of {logical_size}, ignoring"
                 )
             memory_obj.ref_count_down()
             return None
@@ -845,7 +847,7 @@ class WekaGdsBackend(StorageBackendInterface):
 
         :param lookup_id: Identifier for the lookup operation
         :param keys: The keys to retrieve
-        :return: List of MemoryObj instances
+        :return: List of MemoryObj instances (may contain None for missing keys)
         """
         return await self._async_batched_get_blocking(keys)  # type: ignore[return-value]
 
