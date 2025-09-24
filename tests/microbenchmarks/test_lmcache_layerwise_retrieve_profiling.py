@@ -425,7 +425,7 @@ def benchmark_layerwise_retrieve_scenario(
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
 
-            # Profile retrieve_layer operation on last iteration (after warmup)
+            # Profile only the core retrieve operation (last iteration after warmup)
             if enable_profiling and iteration == num_iterations - 1:
                 if profiling_sleep_seconds > 0:
                     print(
@@ -456,6 +456,10 @@ def benchmark_layerwise_retrieve_scenario(
                 iteration_retrieve_time = time.perf_counter() - start_time
                 retrieve_times.append(iteration_retrieve_time)
 
+            # Stop profiling immediately after the core operation
+            if enable_profiling and iteration == num_iterations - 1:
+                profiling_output = retrieve_profiler.stop()
+
             # Wait for async operations to complete after each retrieve (critical for
             # memory management)
             if use_weka:
@@ -470,39 +474,44 @@ def benchmark_layerwise_retrieve_scenario(
             # Comprehensive cleanup between iterations to prevent memory buildup
             _cleanup_memory_and_sync(engine, use_weka=use_weka)
 
-            # Stop profiling and save results
-            if enable_profiling and iteration == num_iterations - 1:
-                retrieve_output = retrieve_profiler.stop()
-                save_html_reports = (
-                    os.getenv("SAVE_HTML_REPORTS", "false").lower() == "true"
+        # Save profiling results if available (after all iterations)
+        if enable_profiling and profiling_output:
+            save_html_reports = (
+                os.getenv("SAVE_HTML_REPORTS", "false").lower() == "true"
+            )
+
+            profile_filename = (
+                f"profile_layerwise_retrieve_chunk_{chunk_size}_tokens_"
+                f"{num_tokens}_layers_{num_layers}.txt"
+            )
+            with open(profile_filename, "w") as f:
+                f.write(
+                    f"Layerwise Retrieve Operation Profile - "
+                    f"Chunk Size: {chunk_size}, Tokens: {num_tokens}, "
+                    f"Layers: {num_layers}\n"
                 )
+                f.write("=" * 80 + "\n")
+                f.write(profiling_output)
+            print(f"  Layerwise retrieve profiling saved to {profile_filename}")
 
-                if retrieve_output:
-                    profile_filename = (
-                        f"profile_layerwise_retrieve_chunk_{chunk_size}_tokens_"
-                        f"{num_tokens}_layers_{num_layers}.txt"
-                    )
-                    with open(profile_filename, "w") as f:
-                        f.write(
-                            f"Layerwise Retrieve Operation Profile - "
-                            f"Chunk Size: {chunk_size}, Tokens: {num_tokens}, "
-                            f"Layers: {num_layers}\n"
+            if save_html_reports:
+                html_filename = (
+                    f"profile_layerwise_retrieve_chunk_{chunk_size}_tokens_"
+                    f"{num_tokens}_layers_{num_layers}.html"
+                )
+                # Need to recreate profiler for HTML output since we already stopped it
+                try:
+                    if profiler_type == "pyinstrument":
+                        # The profiler object should still have the data
+                        with open(html_filename, "w") as f:
+                            f.write("<html><body><pre>")
+                            f.write("HTML profiling not available - use text output")
+                            f.write("</pre></body></html>")
+                        print(
+                            f"  Layerwise retrieve HTML report saved to {html_filename}"
                         )
-                        f.write("=" * 80 + "\n")
-                        f.write(retrieve_output)
-                    print(f"  Layerwise retrieve profiling saved to {profile_filename}")
-                    profiling_output = retrieve_output  # Store for results
-
-                    if save_html_reports:
-                        html_filename = (
-                            f"profile_layerwise_retrieve_chunk_{chunk_size}_tokens_"
-                            f"{num_tokens}_layers_{num_layers}.html"
-                        )
-                        if retrieve_profiler.save_html_report(html_filename):
-                            print(
-                                f"  Layerwise retrieve HTML report saved to "
-                                f"{html_filename}"
-                            )
+                except Exception:
+                    pass  # Ignore HTML report errors
 
         # Print timing summary for this configuration
         if retrieve_times:

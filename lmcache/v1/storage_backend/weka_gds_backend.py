@@ -827,15 +827,18 @@ class WekaGdsBackend(StorageBackendInterface):
         entries: list[DiskCacheMetadata] = []
 
         # TODO(Serapheim): Do this properly
-
+        start_time = time.perf_counter()
         # First, collect metadata for all keys
         with self.hot_lock:
             for key in keys:
                 entry = self.hot_cache.get(key)
                 assert entry is not None, f"Key {key} not found in hot cache"
                 entries.append(entry)
+        hot_cache_done_time = time.perf_counter()
 
         # Load memory objects for each key
+        gds_reads = 0
+        gds_read_bytes = 0
         for key, entry in zip(keys, entries, strict=True):
             assert entry is not None, f"Key {key} not found in hot cache"
             try:
@@ -843,6 +846,10 @@ class WekaGdsBackend(StorageBackendInterface):
                     key, entry.path, entry.dtype, entry.shape
                 )
                 if memory_obj is not None:
+                    gds_reads += 1
+                    gds_read_bytes += memory_obj.get_size()
+                    # TODO(Serapheim): check if this is correct,
+                    #  if not needed fix benchmark code
                     memory_obj.ref_count_up()
                     mem_objs.append(memory_obj)
             except Exception as e:
@@ -850,6 +857,15 @@ class WekaGdsBackend(StorageBackendInterface):
                     f"Failed to load memory object for key {key}: {e}",
                     exc_info=True,
                 )
+        gds_done_time = time.perf_counter()
+
+        total_time = gds_done_time - start_time
+        logger.info(
+            f"Time taken for batched_get_non_blocking: {total_time:.3f}s |"
+            f" Hot cache time: {hot_cache_done_time - start_time:.3f}s |"
+            f" GDS time: {gds_done_time - hot_cache_done_time:.3f}s |"
+            f" {gds_read_bytes / 1024 / 1024}MiB | {gds_reads} ops."
+        )
 
         return mem_objs
 
