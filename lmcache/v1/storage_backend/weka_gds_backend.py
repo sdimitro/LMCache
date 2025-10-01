@@ -418,8 +418,18 @@ class WekaGdsBackend(StorageBackendInterface):
         memory_objs: List[MemoryObj],
         transfer_spec=None,
     ) -> None:
-        for key, memory_obj in zip(keys, memory_objs, strict=False):
-            self.submit_put_task(key, memory_obj)
+        # 1. Ref count up all objects upfront
+        for memory_obj in memory_objs:
+            memory_obj.ref_count_up()
+
+        # 2. Add all keys to put_tasks in one lock acquisition
+        with self.put_lock:
+            self.put_tasks.update(keys)
+
+        # 3. Submit a single async task that coordinates parallel saves
+        asyncio.run_coroutine_threadsafe(
+            self._batch_save_bytes_to_disk(keys, memory_objs), self.loop
+        )
 
     async def _async_save_bytes_to_disk(
         self,
@@ -477,6 +487,122 @@ class WekaGdsBackend(StorageBackendInterface):
                 self.hot_cache.pop(key, None)
         with self.put_lock:
             self.put_tasks.discard(key)
+
+    async def _batch_save_bytes_to_disk(
+        self,
+        keys: Sequence[CacheEngineKey],
+        memory_objs: List[MemoryObj],
+    ) -> None:
+        """
+        Save multiple memory objects to disk concurrently using thread pool.
+        Does batched bookkeeping operations to minimize lock contention.
+        Note: Assumes ref_count_up and put_tasks have already been handled by caller.
+        """
+        kv_chunks = []
+        paths = []
+        tmp_suffixes = []
+        metadata_addresses = []
+
+        for key, memory_obj in zip(keys, memory_objs, strict=False):
+            kv_chunk = memory_obj.tensor
+            assert kv_chunk is not None
+            kv_chunks.append(kv_chunk)
+
+            path, subdir_key, l1_dir, l2_dir = self._key_to_path(key)
+            if subdir_key not in self.metadata_dirs:
+                os.makedirs(os.path.join(self.weka_path, l1_dir, l2_dir), exist_ok=True)
+                self.metadata_dirs.add(subdir_key)
+            tmp = ".tmp" + rand_suffix(self.rand, 8)
+
+            tmp_suffixes.append(tmp)
+            paths.append(path)
+            metadata_addresses.append(memory_obj.metadata.address)
+
+        # Run all GDS saves in parallel using thread pool (heavy I/O only)
+        results = await asyncio.to_thread(
+            lambda: list(
+                self._thread_pool.map(
+                    self._sync_save_bytes_to_disk_inner,
+                    paths,
+                    tmp_suffixes,
+                    kv_chunks,
+                    metadata_addresses,
+                )
+            )
+        )
+
+        cache_entries = {}
+        for i, result in enumerate(results):
+            if result is None:
+                continue
+            key = keys[i]
+            memory_obj = memory_objs[i]
+            size = memory_obj.get_size()
+            shape = memory_obj.metadata.shape
+            dtype = memory_obj.metadata.dtype
+            cache_entries[key] = DiskCacheMetadata(paths[i], size, shape, dtype)
+
+        # Batch insert all keys into hot_cache (single lock acquisition)
+        if cache_entries:
+            with self.hot_lock:
+                self.hot_cache.update(cache_entries)
+
+        for memory_obj in memory_objs:
+            memory_obj.ref_count_down()
+
+        # Queue async metadata writes for successful operations (non-blocking)
+        for key, metadata, path, tmp in zip(
+            keys, results, paths, tmp_suffixes, strict=False
+        ):
+            if metadata is None:
+                continue
+            metadata_bytes: bytes = metadata
+            metadata_path = path + _METADATA_FILE_SUFFIX
+            try:
+                task = asyncio.create_task(
+                    save_metadata(metadata_path, tmp, metadata_bytes)
+                )
+                self.save_metadata_tasks.add(task)
+                task.add_done_callback(self.save_metadata_tasks.discard)
+            except Exception as e:
+                logger.error(
+                    f"POSIX metadata write operation failed for key {key} at path "
+                    f"{metadata_path}: metadata_size_bytes={len(metadata_bytes)}, "
+                    f"tmp_suffix={tmp}, error={e}",
+                    exc_info=True,
+                )
+                with self.hot_lock:
+                    self.hot_cache.pop(key, None)
+
+        # Cleanup: remove all from put_tasks at once
+        with self.put_lock:
+            for key in keys:
+                self.put_tasks.discard(key)
+
+    def _sync_save_bytes_to_disk_inner(
+        self,
+        path: str,
+        tmp: str,
+        kv_chunk: torch.Tensor,
+        metadata_address: int,
+    ) -> Optional[bytes]:
+        try:
+            metadata = self._save_gds_cufile(
+                path,
+                tmp,
+                kv_chunk,
+                self.cufile_base_pointer,
+                metadata_address,
+            )
+        except Exception as e:
+            logger.error(
+                f"GDS/cuFile write operation failed for tensor at path {path}: "
+                f"tensor_shape={kv_chunk.shape}, tensor_dtype={kv_chunk.dtype}, "
+                f"tensor_size_bytes={kv_chunk.nbytes}, error={e}",
+                exc_info=True,
+            )
+            return None
+        return metadata
 
     def insert_key(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
         path, _, _, _ = self._key_to_path(key)
