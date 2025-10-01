@@ -402,7 +402,6 @@ class WekaGdsBackend(StorageBackendInterface):
             return key in self.put_tasks
 
     def submit_put_task(self, key: CacheEngineKey, memory_obj: MemoryObj) -> Future:
-        assert memory_obj.tensor is not None
         memory_obj.ref_count_up()
 
         with self.put_lock:
@@ -549,10 +548,9 @@ class WekaGdsBackend(StorageBackendInterface):
         Returns:
             The memory object with loaded data, or None if loading failed
         """
-        if memory_obj is None or memory_obj.tensor is None:
+        if memory_obj is None:
             return None
-        assert memory_obj.tensor.is_cuda
-        assert torch.device(self.dst_device) == torch.device(memory_obj.tensor.device)
+
         # Read logical size instead of physical size since
         # we only store logical size in file
         logical_size = memory_obj.get_size()
@@ -611,9 +609,6 @@ class WekaGdsBackend(StorageBackendInterface):
         if memory_obj is None:
             logger.error("Memory allocation failed during sync disk load.")
             return None
-        assert memory_obj.tensor is not None
-        assert memory_obj.tensor.is_cuda
-        assert torch.device(self.dst_device) == torch.device(memory_obj.tensor.device)
 
         return self._load_bytes_from_disk_with_memory(key, path, memory_obj)
 
