@@ -7,7 +7,12 @@ from typing import Any, Callable, List, Optional, Sequence, Tuple
 import asyncio
 import ctypes
 import os
+import pickle
+import struct
 import threading
+
+# Third Party
+import torch
 
 # First Party
 from lmcache.logging import init_logger
@@ -26,9 +31,36 @@ from lmcache.v1.weka_specific import wio
 logger = init_logger(__name__)
 
 
+# Mapping of torch dtypes to integer IDs for efficient serialization
+TORCH_DTYPE_TO_ID = {
+    torch.float16: 0,
+    torch.half: 0,  # Alias for float16
+    torch.bfloat16: 1,
+    torch.float32: 2,
+    torch.float: 2,  # Alias for float32
+    torch.float64: 3,
+    torch.double: 3,  # Alias for float64
+    torch.uint8: 4,
+    torch.float8_e4m3fn: 5,
+    torch.float8_e5m2: 6,
+}
+
+# Reverse mapping: ID to torch dtype (using canonical types)
+ID_TO_TORCH_DTYPE = {
+    0: torch.float16,
+    1: torch.bfloat16,
+    2: torch.float32,
+    3: torch.float64,
+    4: torch.uint8,
+    5: torch.float8_e4m3fn,
+    6: torch.float8_e5m2,
+}
+
+
 class TensorMetadata:
     """
-    TODO(Serapheim): Document this
+    Metadata for a cached tensor, including its location in the arena and
+    shape/dtype info.
     """
 
     def __init__(
@@ -38,14 +70,155 @@ class TensorMetadata:
         arena_offset: int,
         size: int,
         shape: Tuple[int, ...],
-        dtype: str,
+        dtype,  # Can be torch.dtype or int
     ):
         self.key = key
         self.arena_id = arena_id
         self.arena_offset = arena_offset
         self.size = size
         self.shape = shape
-        self.dtype = dtype
+
+        # Convert dtype to int ID for efficient storage
+        if isinstance(dtype, int):
+            self.dtype_id = dtype
+        else:
+            # Assume it's a torch.dtype
+            if dtype not in TORCH_DTYPE_TO_ID:
+                raise ValueError(f"Unsupported dtype: {dtype}")
+            self.dtype_id = TORCH_DTYPE_TO_ID[dtype]
+
+    def get_torch_dtype(self) -> torch.dtype:
+        """Get the torch.dtype for this tensor."""
+        return ID_TO_TORCH_DTYPE[self.dtype_id]
+
+    def to_bytes(self) -> bytes:
+        """
+        Serialize TensorMetadata to bytes using custom struct-based format
+        for maximum performance.
+
+        Format:
+            - Fixed-size header (57 bytes):
+              - 2 unsigned long longs (Q): world_size, worker_id
+              - 1 signed long long (q): chunk_hash (can be negative)
+              - 3 unsigned long longs (Q): arena_id, arena_offset, size
+              - 4 unsigned ints (I): num_dims, fmt_len, model_len, tags_len
+              - 1 unsigned byte (B): dtype_id
+            - Variable-length data: shape array, fmt string, model_name string, tags
+
+        Returns:
+            bytes: Binary representation of this TensorMetadata object.
+        """
+        # Encode variable-length data
+        fmt_bytes = self.key.fmt.encode("utf-8")
+        model_bytes = self.key.model_name.encode("utf-8")
+        tags_bytes = pickle.dumps(self.key.tags) if self.key.tags else b""
+
+        # Pack fixed-size header (57 bytes)
+        # Format: 2Q (unsigned) + 1q (signed) + 3Q (unsigned) + 4I + 1B
+        header = struct.pack(
+            "!2Qq3Q4IB",
+            self.key.world_size,
+            self.key.worker_id,
+            self.key.chunk_hash,  # signed - can be negative
+            self.arena_id,
+            self.arena_offset,
+            self.size,
+            len(self.shape),  # number of dimensions
+            len(fmt_bytes),  # length of fmt string
+            len(model_bytes),  # length of model_name string
+            len(tags_bytes),  # length of tags data (0 if None)
+            self.dtype_id,  # dtype as single byte
+        )
+
+        # Pack shape tuple as array of signed long longs
+        shape_data = struct.pack(f"!{len(self.shape)}q", *self.shape)
+
+        # Concatenate all variable-length data
+        return header + shape_data + fmt_bytes + model_bytes + tags_bytes
+
+    @staticmethod
+    def from_bytes(data: bytes) -> "TensorMetadata":
+        """
+        Deserialize TensorMetadata from bytes.
+
+        Args:
+            data: Binary data containing a TensorMetadata object.
+
+        Returns:
+            TensorMetadata: Deserialized TensorMetadata object.
+        """
+        # Unpack fixed-size header (57 bytes)
+        header_size = struct.calcsize("!2Qq3Q4IB")
+        header = struct.unpack("!2Qq3Q4IB", data[:header_size])
+
+        world_size, worker_id, chunk_hash = header[0], header[1], header[2]
+        arena_id, arena_offset, size = header[3], header[4], header[5]
+        num_dims, fmt_len, model_len, tags_len = (
+            header[6],
+            header[7],
+            header[8],
+            header[9],
+        )
+        dtype_id = header[10]
+
+        # Unpack shape
+        offset = header_size
+        shape = struct.unpack(f"!{num_dims}q", data[offset : offset + num_dims * 8])
+        offset += num_dims * 8
+
+        # Unpack variable-length strings
+        fmt_str = data[offset : offset + fmt_len].decode("utf-8")
+        offset += fmt_len
+
+        model_name = data[offset : offset + model_len].decode("utf-8")
+        offset += model_len
+
+        # Unpack tags (if present)
+        tags = None
+        if tags_len > 0:
+            tags = pickle.loads(data[offset : offset + tags_len])
+
+        # Reconstruct CacheEngineKey
+        key = CacheEngineKey(
+            fmt=fmt_str,
+            model_name=model_name,
+            world_size=world_size,
+            worker_id=worker_id,
+            chunk_hash=chunk_hash,
+        )
+        key.tags = tags
+
+        return TensorMetadata(
+            key=key,
+            arena_id=arena_id,
+            arena_offset=arena_offset,
+            size=size,
+            shape=shape,
+            dtype=dtype_id,  # Pass as int, constructor will handle it
+        )
+
+    # # Alternative: Pickle-based implementation (simpler but slightly slower)
+    # def to_bytes(self) -> bytes:
+    #     """
+    #     Serialize TensorMetadata to bytes using pickle for maximum performance.
+    #
+    #     Returns:
+    #         bytes: Pickled representation of this TensorMetadata object.
+    #     """
+    #     return pickle.dumps(self, protocol=pickle.HIGHEST_PROTOCOL)
+    #
+    # @staticmethod
+    # def from_bytes(data: bytes) -> "TensorMetadata":
+    #     """
+    #     Deserialize TensorMetadata from bytes.
+    #
+    #     Args:
+    #         data: Pickled bytes containing a TensorMetadata object.
+    #
+    #     Returns:
+    #         TensorMetadata: Deserialized TensorMetadata object.
+    #     """
+    #     return pickle.loads(data)
 
 
 class OperationTimeoutError(Exception):
@@ -418,7 +591,7 @@ class WekaGdsBackend(StorageBackendInterface):
         )
         return future
 
-    def _process_put_task(self, key: CacheEngineKey, memory_obj: MemoryObj):
+    async def _process_put_task(self, key: CacheEngineKey, memory_obj: MemoryObj):
         """
         TODO(Serapheim): Document this
         """
@@ -440,23 +613,24 @@ class WekaGdsBackend(StorageBackendInterface):
             shape=tensor.shape,
             dtype=tensor.dtype,
         )
-        # metadata_bytes = metadata.to_bytes()  # TODO(Serapheim): implement
-        # assert len(metadata_bytes) <= _METADATA_MAX_SIZE, "Metadata size is too large"
+        metadata_bytes = metadata.to_bytes()
+        assert len(metadata_bytes) <= _METADATA_MAX_SIZE, "Metadata size is too large"
 
         # First we write the metadata to the arena
         # TODO(Serapheim): Use operation manageger for the write
-        # ret = os.pwrite(
-        #     arena_handle.get_file_handle(),
-        #     metadata_bytes,
-        #     arena_offset + _METADATA_MAX_SIZE,
-        # )
-        # if ret != len(metadata_bytes):
-        #     logger.error(
-        #         f"Failed to write {key} metadata to arena {arena_id} at "
-        #         f"offset {arena_offset}: {ret} != {len(metadata_bytes)}"
-        #     )
-        #     memory_obj.ref_count_down()
-        #     return
+        # TODO(Serapheim): pwrite in WIO
+        ret = os.pwrite(
+            arena_handle.get_file_handle(),
+            metadata_bytes,
+            arena_offset + _METADATA_MAX_SIZE,
+        )
+        if ret != len(metadata_bytes):
+            logger.error(
+                f"Failed to write {key} metadata to arena {arena_id} at "
+                f"offset {arena_offset}: {ret} != {len(metadata_bytes)}"
+            )
+            memory_obj.ref_count_down()
+            return
 
         # Then we write the tensor to the arena
         # TODO(Serapheim): Use operation manageger for the write
