@@ -423,7 +423,7 @@ def benchmark_batched_put_scenario(
                 num_keys, chunk_size=chunk_size, num_layers=num_layers
             )
             memory_objects = generate_test_memory_objects(
-                num_keys, object_size_mb, backend.memory_allocator
+                num_keys, object_size_mb, backend._memory_allocator
             )
 
             # Clear CUDA cache
@@ -544,7 +544,7 @@ def benchmark_batched_put_scenario(
                     while mem_obj.get_ref_count() > 0:
                         mem_obj.ref_count_down()
                     # Free the memory object
-                    backend.memory_allocator.free(mem_obj)
+                    backend._memory_allocator.free(mem_obj)
                 except Exception:
                     pass  # Ignore cleanup errors
 

@@ -200,7 +200,7 @@ def memory_obj_factory():
         shape: tuple = (2, 16, 8, 128),
         dtype: torch.dtype = torch.bfloat16,
     ) -> MemoryObj:
-        memory_obj = backend.memory_allocator.allocate(
+        memory_obj = backend._memory_allocator.allocate(
             shape, dtype, fmt=MemoryFormat.KV_T2D
         )
         assert memory_obj is not None, "Failed to allocate memory object"
