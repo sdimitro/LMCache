@@ -645,6 +645,9 @@ class WekaGdsBackend(StorageBackendInterface):
                 f"offset {arena_offset}: {ret} != {len(metadata_bytes)}"
             )
             memory_obj.ref_count_down()
+            # Remove from put_tasks even on error
+            with self.put_lock:
+                self.put_tasks.discard(key)
             return
 
         # Then we write the tensor to the arena
@@ -662,6 +665,9 @@ class WekaGdsBackend(StorageBackendInterface):
                 f"{ret} != {tensor.nbytes}"
             )
             memory_obj.ref_count_down()
+            # Remove from put_tasks even on error
+            with self.put_lock:
+                self.put_tasks.discard(key)
             return
 
         # Then we record the insertion in the journal
@@ -672,6 +678,10 @@ class WekaGdsBackend(StorageBackendInterface):
         with self.hot_lock:
             self.hot_cache[key] = metadata
         memory_obj.ref_count_down()
+
+        # Remove the key from put_tasks to signal completion
+        with self.put_lock:
+            self.put_tasks.discard(key)
 
     def batched_submit_put_task(
         self,
