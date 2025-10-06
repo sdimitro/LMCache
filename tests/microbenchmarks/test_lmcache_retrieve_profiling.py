@@ -717,6 +717,7 @@ def run_retrieve_benchmark(
     all_results = []
 
     print("Running retrieve() profiling benchmark with:")
+    print(f"  Device: {device}")
     print(f"  Chunk sizes: {chunk_sizes}")
     print(f"  Token counts: {token_counts}")
     print(f"  Iterations per config: {num_iterations}")
@@ -967,7 +968,34 @@ if __name__ == "__main__":
         help="Number of transformer layers to simulate (default: 2)",
     )
 
+    parser.add_argument(
+        "--gpu",
+        type=int,
+        default=0,
+        help="GPU device ID to use (default: 0, use -1 for CPU)",
+    )
+
     args = parser.parse_args()
+
+    # Set up device based on GPU argument
+    if args.gpu == -1:
+        device = "cpu"
+        print("Using CPU for computation")
+    else:
+        if not torch.cuda.is_available():
+            print("WARNING: CUDA not available, falling back to CPU")
+            device = "cpu"
+        elif args.gpu >= torch.cuda.device_count():
+            print(
+                f"WARNING: GPU {args.gpu} not available "
+                f"(only {torch.cuda.device_count()} GPUs found), using GPU 0"
+            )
+            device = "cuda:0"
+            torch.cuda.set_device(0)
+        else:
+            device = f"cuda:{args.gpu}"
+            torch.cuda.set_device(args.gpu)
+            print(f"Using GPU {args.gpu}: {torch.cuda.get_device_name(args.gpu)}")
 
     # Run benchmark
     run_retrieve_benchmark(
@@ -984,5 +1012,6 @@ if __name__ == "__main__":
         gds_io_threads=args.gds_io_threads,
         save_html_reports=args.save_html_reports,
         clear_cache=args.clear_cache,
+        device=device,
         num_layers=args.num_layers,
     )
