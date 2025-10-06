@@ -969,7 +969,7 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--gpu",
+        "--gpu-slot",
         type=int,
         default=0,
         help="GPU device ID to use (default: 0, use -1 for CPU)",
@@ -978,24 +978,27 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Set up device based on GPU argument
-    if args.gpu == -1:
+    if args.gpu_slot == -1:
         device = "cpu"
         print("Using CPU for computation")
     else:
         if not torch.cuda.is_available():
             print("WARNING: CUDA not available, falling back to CPU")
             device = "cpu"
-        elif args.gpu >= torch.cuda.device_count():
+        elif args.gpu_slot >= torch.cuda.device_count():
             print(
-                f"WARNING: GPU {args.gpu} not available "
+                f"WARNING: GPU {args.gpu_slot} not available "
                 f"(only {torch.cuda.device_count()} GPUs found), using GPU 0"
             )
             device = "cuda:0"
             torch.cuda.set_device(0)
         else:
-            device = f"cuda:{args.gpu}"
-            torch.cuda.set_device(args.gpu)
-            print(f"Using GPU {args.gpu}: {torch.cuda.get_device_name(args.gpu)}")
+            device = f"cuda:{args.gpu_slot}"
+            torch.cuda.set_device(args.gpu_slot)
+            print(
+                f"Using GPU {args.gpu_slot}: "
+                f"{torch.cuda.get_device_name(args.gpu_slot)}"
+            )
 
     # Run benchmark
     run_retrieve_benchmark(
