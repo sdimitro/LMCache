@@ -10,6 +10,7 @@ import os
 import pickle
 import struct
 import threading
+import time
 
 # Third Party
 import torch
@@ -376,6 +377,7 @@ class ArenaManager:
         self._arena_manager_lock = threading.Lock()
         self._arena_map: OrderedDict[int, ArenaMetadata] = OrderedDict()
         self._active_arena_id = -1
+        self._arena_max_size_bytes = arena_max_size_gb * 1024**3
 
         self._working_directory = os.path.join(weka_path, lmcache_instance_id)
         os.makedirs(self._working_directory, exist_ok=True)
@@ -394,6 +396,13 @@ class ArenaManager:
             self._active_arena_id = (
                 max(self._arena_map.keys()) if self._arena_map else -1
             )
+
+    def get_arena_handle(self, arena_id: int) -> wio.WioHandle:
+        """
+        TODO(Serapheim): Document this
+        """
+        with self._arena_manager_lock:
+            return self._arena_map[arena_id].wio_handle
 
     def _create_arena_unsafe(self) -> None:
         """
@@ -417,7 +426,7 @@ class ArenaManager:
                 self._create_arena_unsafe()
             elif (
                 self._arena_map[self._active_arena_id].get_size()
-                > self.DEFAULT_ARENA_MAX_SIZE_BYTES
+                > self._arena_max_size_bytes
             ):
                 logger.debug("Current arena is full, creating a new one")
                 self._create_arena_unsafe()
@@ -520,6 +529,8 @@ class WekaGdsBackend(StorageBackendInterface):
     TODO(Serapheim): Document this backend
     """
 
+    METADATA_MAX_SIZE = 4 * 1024  # 4KB
+
     def __init__(
         self,
         config: LMCacheEngineConfig,
@@ -576,8 +587,11 @@ class WekaGdsBackend(StorageBackendInterface):
             return key in self.hot_cache
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
-        # TODO(Serapheim): implement this
-        return False
+        """
+        TODO(Serapheim): Document this
+        """
+        with self.put_lock:
+            return key in self.put_tasks
 
     def submit_put_task(self, key: CacheEngineKey, memory_obj: MemoryObj) -> Future:
         """
@@ -599,10 +613,9 @@ class WekaGdsBackend(StorageBackendInterface):
         tensor = memory_obj.tensor
         assert tensor is not None
 
-        _METADATA_MAX_SIZE = 4 * 1024  # 4KB
         arena_id, arena_offset, arena_handle = (
             self._arena_manager.allocate_ondisk_space(
-                tensor.nbytes + _METADATA_MAX_SIZE
+                tensor.nbytes + self.METADATA_MAX_SIZE
             )
         )
         metadata = TensorMetadata(
@@ -614,7 +627,9 @@ class WekaGdsBackend(StorageBackendInterface):
             dtype=tensor.dtype,
         )
         metadata_bytes = metadata.to_bytes()
-        assert len(metadata_bytes) <= _METADATA_MAX_SIZE, "Metadata size is too large"
+        assert len(metadata_bytes) <= self.METADATA_MAX_SIZE, (
+            "Metadata size is too large"
+        )
 
         # First we write the metadata to the arena
         # TODO(Serapheim): Use operation manageger for the write
@@ -622,7 +637,7 @@ class WekaGdsBackend(StorageBackendInterface):
         ret = os.pwrite(
             arena_handle.get_file_handle(),
             metadata_bytes,
-            arena_offset + _METADATA_MAX_SIZE,
+            arena_offset + self.METADATA_MAX_SIZE,
         )
         if ret != len(metadata_bytes):
             logger.error(
@@ -637,21 +652,20 @@ class WekaGdsBackend(StorageBackendInterface):
         ret = arena_handle.write(
             ctypes.c_void_p(self._cufile_base_pointer),
             tensor.nbytes,
-            arena_offset + _METADATA_MAX_SIZE,
+            arena_offset + self.METADATA_MAX_SIZE,
             memory_obj.metadata.address,
         )
         if ret != tensor.nbytes:
             logger.error(
                 f"Failed to write {key} tensor to arena {arena_id} at "
-                f"offset {arena_offset + _METADATA_MAX_SIZE}: {ret} != {tensor.nbytes}"
+                f"offset {arena_offset + self.METADATA_MAX_SIZE}: "
+                f"{ret} != {tensor.nbytes}"
             )
             memory_obj.ref_count_down()
             return
 
         # Then we record the insertion in the journal
-        self._checkpoint_manager.record_insertions(
-            [metadata]
-        )  # TODO(Serapheim): implement
+        self._checkpoint_manager.record_insertions([metadata])
 
         # Then we finally add the key to the hot cache and decrement
         # the reference count for the memory object
@@ -665,26 +679,152 @@ class WekaGdsBackend(StorageBackendInterface):
         memory_objs: List[MemoryObj],
         transfer_spec=None,
     ) -> None:
+        """
+        TODO(Serapheim): Document this
+        """
+        # 1. Ref count up all objects upfront
+        for memory_obj in memory_objs:
+            memory_obj.ref_count_up()
+
+        # 2. Add all keys to put_tasks in one lock acquisition
+        with self.put_lock:
+            self.put_tasks.update(keys)
+
+        # 3. Submit a single async task that coordinates parallel saves
+        asyncio.run_coroutine_threadsafe(
+            self._batch_process_put_task(keys, memory_objs), self._loop
+        )
+
+    async def _batch_process_put_task(
+        self, keys: Sequence[CacheEngineKey], memory_objs: List[MemoryObj]
+    ):
+        """
+        TODO(Serapheim): Document this
+        """
         for key, memory_obj in zip(keys, memory_objs, strict=False):
-            self.submit_put_task(key, memory_obj)
+            asyncio.run_coroutine_threadsafe(
+                self._process_put_task(key, memory_obj), self._loop
+            )
 
     def insert_key(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
-        # TODO(Serapheim): implement this
+        # TODO(Serapheim): implement this | do we need this?
         return None
+
+    def _load_bytes_from_arena(
+        self,
+        key: CacheEngineKey,
+        target_arena: int,
+        target_offset: int,
+        memory_obj: MemoryObj,
+    ) -> Optional[MemoryObj]:
+        """
+        TODO(Serapheim): Document this
+        """
+        tensor_size = memory_obj.get_size()
+        tensor_offset = target_offset + self.METADATA_MAX_SIZE
+        arena_handle = self._arena_manager.get_arena_handle(target_arena)
+        ret = arena_handle.read(
+            ctypes.c_void_p(self._cufile_base_pointer),
+            tensor_size,
+            tensor_offset,
+            memory_obj.metadata.address,
+        )
+        if ret != tensor_size:
+            if ret < 0:
+                logger.error(
+                    f"Failed to read {key} tensor from arena {target_arena} at "
+                    f"offset {tensor_offset}: error code {ret}"
+                    "Removing entry from cache"
+                )
+                with self.hot_lock:
+                    self.hot_cache.pop(key)
+            else:
+                logger.error(
+                    f"Part read {key} tensor from arena {target_arena} at "
+                    f"offset {tensor_offset}: {ret} != {tensor_size}"
+                )
+            memory_obj.ref_count_down()
+            return None
+        return memory_obj
 
     def get_blocking(
         self,
         key: CacheEngineKey,
     ) -> Optional[MemoryObj]:
-        # TODO(Serapheim): implement this
-        return None
+        """
+        TODO(Serapheim): Document this
+        """
+        # TODO(Serapheim): do we need this?
+        with self.hot_lock:
+            metadata = self.hot_cache.get(key)
+            if metadata is None:
+                return None
+
+        memory_obj = self._memory_allocator.allocate(
+            metadata.shape, metadata.get_torch_dtype()
+        )
+        if memory_obj is None:
+            logger.error(f"get_blocking: Memory allocation failed for key {key}")
+            return None
+        return self._load_bytes_from_arena(
+            key, metadata.arena_id, metadata.arena_offset, memory_obj
+        )
 
     def batched_get_blocking(
         self,
         keys: List[CacheEngineKey],
     ) -> list[MemoryObj | None]:
-        # TODO(Serapheim): implement this
-        return [None] * len(keys)
+        """
+        TODO(Serapheim): Document this
+        """
+        arena_ids: list[int | None] = []
+        arena_offsets: list[int | None] = []
+        dtypes: list[torch.dtype | None] = []
+        shapes: list[torch.Size | None] = []
+        with self.hot_lock:
+            for key in keys:
+                entry = self.hot_cache.get(key)
+                if entry is None:
+                    logger.error(f"batched_get_blocking: Lookup failed for {key}")
+                    arena_ids.append(None)
+                    arena_offsets.append(None)
+                    dtypes.append(None)
+                    shapes.append(None)
+                    continue
+                arena_ids.append(entry.arena_id)
+                arena_offsets.append(entry.arena_offset)
+                dtypes.append(entry.get_torch_dtype())
+                shapes.append(entry.shape)
+
+        memory_objs: list[MemoryObj | None] = []
+        gds_reads, gds_read_bytes = 0, 0
+        for dtype, shape in zip(dtypes, shapes, strict=True):
+            if dtype is None:
+                memory_objs.append(None)
+                continue
+            memory_obj = self._memory_allocator.allocate(shape, dtype)
+            if memory_obj is None:
+                logger.error(
+                    f"batched_get_blocking: Memory allocation failed "
+                    f"shape {shape} dtype {dtype}"
+                )
+            else:
+                gds_reads += 1
+                gds_read_bytes += memory_obj.get_size()
+            memory_objs.append(memory_obj)
+
+        start_time = time.perf_counter()
+        results = list(
+            self._thread_pool.map(
+                self._load_bytes_from_arena, keys, arena_ids, arena_offsets, memory_objs
+            )
+        )
+        total_time = time.perf_counter() - start_time
+        logger.info(
+            f"Time taken for batched_get_blocking: {total_time:.3f}s |"
+            f" {gds_read_bytes / 1024 / 1024}MiB | {gds_reads} ops."
+        )
+        return results
 
     def pin(self, key: CacheEngineKey) -> bool:
         # TODO(Serapheim): implement this
