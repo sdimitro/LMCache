@@ -1607,3 +1607,168 @@ def test_batched_async_contains_partial():
 def test_batched_async_contains_mixed_cache():
     """Test batched_async_contains with mixed hot_cache and disk scenarios."""
     init_and_teardown(batched_async_contains_mixed_cache_test)
+
+
+def test_cufile_allocator_with_local_cpu_backend_eviction():
+    """
+    Test that reproduces the AssertionError when LocalCPUBackend
+    tries to evict with a CuFileMemoryAllocator.
+
+    This test simulates the scenario where:
+    1. WekaGdsBackend is configured with CuFileMemoryAllocator
+    2. LocalCPUBackend is created as always but not used.
+    3. StorageManager routes allocations to LocalCPUBackend
+       (default when enable_nixl=False)
+    4. Memory is full, triggering eviction in LocalCPUBackend
+    5. The assertion fails because CuFileMemoryAllocator is not
+       MixedMemoryAllocator or NixlCPUMemoryAllocator
+
+    Expected: AssertionError with message about allocator type mismatch
+    """
+    # First Party
+    from lmcache.config import LMCacheEngineMetadata
+    from lmcache.v1.event_manager import EventManager
+    from lmcache.v1.storage_backend.storage_manager import StorageManager
+
+    WEKA_DIR = "/mnt/weka/test-cache-eviction"
+    thread_loop = None
+    thread = None
+    storage_manager = None
+
+    try:
+        os.makedirs(WEKA_DIR, exist_ok=True)
+
+        # Create a small buffer (2 MB) to easily trigger memory pressure
+        small_buffer_size = 2  # MB
+        config = LMCacheEngineConfig.from_defaults(
+            chunk_size=256,
+            weka_path=WEKA_DIR,
+            lmcache_instance_id="test_eviction",
+            cufile_buffer_size=small_buffer_size,
+            local_cpu=False,  # LocalCPUBackend will be created anyways
+            extra_config={"gds_io_threads": 4},
+        )
+
+        # Create metadata
+        metadata = LMCacheEngineMetadata(
+            model_name="test-model",
+            world_size=1,
+            worker_id=0,
+            fmt="vllm",
+            kv_dtype=torch.bfloat16,
+            kv_shape=(32, 2, 256, 8, 128),  # Large enough to fill memory
+        )
+
+        # Create CuFileMemoryAllocator (GPU allocator)
+        allocator = CuFileMemoryAllocator(small_buffer_size * 1024**2)
+
+        # Create event loop
+        thread_loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=thread_loop.run_forever)
+        thread.start()
+
+        # Create event manager
+        event_manager = EventManager()
+
+        # Create StorageManager - this will create both WekaGdsBackend and
+        # LocalCPUBackend
+        # Both will receive the same CuFileMemoryAllocator
+        # StorageManager will use LocalCPUBackend as allocator_backend (default)
+        storage_manager = StorageManager(
+            config=config,
+            metadata=metadata,
+            allocator=allocator,
+            event_manager=event_manager,
+        )
+
+        # Verify that we have both backends
+        assert "LocalCPUBackend" in storage_manager.storage_backends, (
+            "LocalCPUBackend should be created"
+        )
+        assert "WekaGdsBackend" in storage_manager.storage_backends, (
+            "WekaGdsBackend should be created"
+        )
+
+        # Verify LocalCPUBackend is using the CuFileMemoryAllocator
+        local_cpu_backend = storage_manager.storage_backends["LocalCPUBackend"]
+        assert isinstance(local_cpu_backend.memory_allocator, CuFileMemoryAllocator), (
+            "LocalCPUBackend should have CuFileMemoryAllocator"
+        )
+
+        # Fill up memory by allocating until we can't allocate anymore
+        # Shape that will take up significant space: (2, 16, 8, 128) bfloat16
+        # Size = 2 * 16 * 8 * 128 * 2 bytes = 65,536 bytes = 64 KB per allocation
+        shape = (2, 16, 8, 128)
+        dtype = torch.bfloat16
+        fmt = MemoryFormat.KV_T2D
+
+        allocated_objs = []
+        # Try to allocate many objects to fill the 2MB buffer
+        # 2MB / 64KB = 32 allocations theoretically, but fragmentation may reduce this
+        for i in range(40):  # Try more than theoretical max
+            memory_obj = storage_manager.allocate(
+                shape, dtype, fmt, eviction=False, busy_loop=False
+            )
+            if memory_obj is None:
+                # Memory is full
+                break
+            allocated_objs.append(memory_obj)
+
+        print(f"Allocated {len(allocated_objs)} objects before running out of memory")
+
+        # Now try to allocate one more with eviction enabled
+        # Since LocalCPUBackend.use_hot is True but hot_cache is empty,
+        # there are no eviction candidates
+        # This will trigger the eviction path in LocalCPUBackend.allocate()
+        # which will hit the assertion error
+        try:
+            memory_obj = storage_manager.allocate(
+                shape, dtype, fmt, eviction=True, busy_loop=False
+            )
+            # If we reach here, the bug has been fixed
+            print("SUCCESS: No AssertionError - the bug has been fixed!")
+            # In the fixed version, this should return None
+            # since there's nothing to evict
+            assert memory_obj is None, (
+                "Should return None when allocation fails and no eviction candidates"
+            )
+        except AssertionError as e:
+            # This is the expected error in the buggy version
+            error_msg = str(e)
+            print(f"EXPECTED ERROR (bug reproduced): {error_msg}")
+
+            # Verify this is the specific assertion we're looking for
+            # The assertion happens at line 266 in local_cpu_backend.py
+            # and has no message, so we check the traceback
+            # Standard
+            import traceback
+
+            tb = traceback.format_exc()
+            assert "local_cpu_backend.py" in tb, (
+                f"Expected error from local_cpu_backend.py, got:\n{tb}"
+            )
+            assert "isinstance(self.memory_allocator, MixedMemoryAllocator)" in tb or (
+                "allocate" in tb and "assert" in tb.lower()
+            ), f"Expected assertion about allocator type, got:\n{tb}"
+
+            # Re-raise to make the test fail and show that we've reproduced the issue
+            raise
+        finally:
+            # Clean up allocated objects
+            for obj in allocated_objs:
+                obj.ref_count_down()
+
+    finally:
+        # Cleanup
+        if storage_manager is not None:
+            storage_manager.close()
+
+        if thread_loop is not None:
+            if thread_loop.is_running():
+                thread_loop.call_soon_threadsafe(thread_loop.stop)
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=5.0)
+            thread_loop.close()
+
+        if os.path.exists(WEKA_DIR):
+            shutil.rmtree(WEKA_DIR, ignore_errors=True)
