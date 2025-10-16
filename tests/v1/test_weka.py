@@ -1624,6 +1624,9 @@ def test_cufile_allocator_with_local_cpu_backend_eviction():
        MixedMemoryAllocator or NixlCPUMemoryAllocator
 
     Expected: AssertionError with message about allocator type mismatch
+    before bug is fixed. After bug is fixed, it should return None.
+
+    Linked issue: WEKAPP-553034
     """
     # First Party
     from lmcache.config import LMCacheEngineMetadata
@@ -1716,11 +1719,6 @@ def test_cufile_allocator_with_local_cpu_backend_eviction():
 
         print(f"Allocated {len(allocated_objs)} objects before running out of memory")
 
-        # Now try to allocate one more with eviction enabled
-        # Since LocalCPUBackend.use_hot is True but hot_cache is empty,
-        # there are no eviction candidates
-        # This will trigger the eviction path in LocalCPUBackend.allocate()
-        # which will hit the assertion error
         try:
             memory_obj = storage_manager.allocate(
                 shape, dtype, fmt, eviction=True, busy_loop=False
@@ -1737,9 +1735,6 @@ def test_cufile_allocator_with_local_cpu_backend_eviction():
             error_msg = str(e)
             print(f"EXPECTED ERROR (bug reproduced): {error_msg}")
 
-            # Verify this is the specific assertion we're looking for
-            # The assertion happens at line 266 in local_cpu_backend.py
-            # and has no message, so we check the traceback
             # Standard
             import traceback
 

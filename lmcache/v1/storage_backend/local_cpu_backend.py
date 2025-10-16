@@ -243,9 +243,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
     ) -> Optional[MemoryObj]:
         """
         Allocate a memory object of shape and dtype
-        evict if necessary. Storage manager should always call
-        local_cpu_backend.allocate() to get memory objects
-        regardless of whether local_cpu is True or False
+        evict if necessary.
         """
         logger.debug(
             f"Allocating memory in local cpu backend with busy loop: {busy_loop}"
@@ -341,9 +339,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
     ) -> Optional[List[MemoryObj]]:
         """
         Batched allocate `batch_size` memory objects of shape and dtype
-        evict if necessary. Storage manager should always call
-        local_cpu_backend.allocate() to get memory objects
-        regardless of whether local_cpu is True or False
+        evict if necessary.
         """
         logger.debug(
             f"Batched allocating memory in local cpu backend"

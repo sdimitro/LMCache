@@ -148,7 +148,12 @@ class StorageManager:
     ) -> AllocatorBackendInterface:
         if self.enable_nixl:
             allocator_backend = self.storage_backends["NixlBackend"]
+        elif config.weka_path is not None:
+            allocator_backend = self.storage_backends["WekaGdsBackend"]
         else:
+            assert "LocalCPUBackend" in self.storage_backends, (
+                "LocalCPUBackend should be created"
+            )
             allocator_backend = self.storage_backends["LocalCPUBackend"]
         assert isinstance(allocator_backend, AllocatorBackendInterface)
         return allocator_backend

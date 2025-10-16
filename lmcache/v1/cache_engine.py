@@ -280,7 +280,7 @@ class LMCacheEngine:
             )
             if memory_obj is None:
                 logger.warning(
-                    "Local cpu memory under pressure so"
+                    "Memory allocator under pressure so"
                     " choosing to not store the KV cache."
                 )
                 break
@@ -389,7 +389,7 @@ class LMCacheEngine:
 
             if memory_objs_multi_layer is None:
                 logger.warning(
-                    "Local cpu memory under pressure so"
+                    "Memory allocator under pressure so"
                     " choosing to not store the KV cache."
                 )
                 break

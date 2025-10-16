@@ -27,11 +27,14 @@ from lmcache.utils import (
 )
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
+    CuFileMemoryAllocator,
     MemoryAllocatorInterface,
     MemoryFormat,
     MemoryObj,
 )
-from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
+from lmcache.v1.storage_backend.abstract_backend import (
+    AllocatorBackendInterface,
+)
 
 logger = init_logger(__name__)
 
@@ -179,7 +182,7 @@ async def save_metadata(path: str, tmp: str, metadata: bytes):
     os.rename(tmp_path, path)
 
 
-class WekaGdsBackend(StorageBackendInterface):
+class WekaGdsBackend(AllocatorBackendInterface):
     """
     This is a backend that leverages NVIDIA's cuFile API to issue GDS requests
     directly to the Weka Filesystem.  In order to use it, users need to specify
@@ -225,6 +228,7 @@ class WekaGdsBackend(StorageBackendInterface):
         self.layerwise = config.use_layerwise
         self.loop = loop
         self.memory_allocator = memory_allocator
+        assert isinstance(self.memory_allocator, CuFileMemoryAllocator)
         self.dst_device = dst_device
 
         assert config.weka_path is not None, (
@@ -254,6 +258,12 @@ class WekaGdsBackend(StorageBackendInterface):
         self.timeout_batched_get_blocking = config.extra_config.get(
             "timeout_batched_get_blocking", 5.0
         )
+
+        self.max_alloc_attempts = config.extra_config.get("max_alloc_attempts", 10)
+        self.alloc_attempt_delay_secs = config.extra_config.get(
+            "allocation_attempt_delay_secs", 0.1
+        )
+        self.enable_blending = config.extra_config.get("enable_blending", False)
 
         self._cufile_driver = self.cufile.CuFileDriver()
         assert hasattr(self.memory_allocator, "base_pointer")
@@ -845,6 +855,138 @@ class WekaGdsBackend(StorageBackendInterface):
         :return: List of MemoryObj instances (may contain None for missing keys)
         """
         return await self._async_batched_get_blocking(keys)  # type: ignore[return-value]
+
+    @_lmcache_nvtx_annotate
+    def allocate(
+        self,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        fmt: Optional[MemoryFormat] = None,
+        eviction: bool = True,
+        busy_loop: bool = True,
+    ) -> Optional[MemoryObj]:
+        """
+        Allocate a memory object of shape and dtype
+        evict if necessary.
+        """
+        logger.debug(
+            f"Allocating memory in WekaGDS backend with busy loop: {busy_loop}"
+            f" with eviction: {eviction}"
+        )
+        if fmt is None:
+            if self.layerwise:
+                if self.enable_blending:
+                    fmt = MemoryFormat.KV_2TD
+                else:
+                    fmt = MemoryFormat.KV_T2D
+            else:
+                fmt = MemoryFormat.KV_2LTD
+
+        memory_obj = self.memory_allocator.allocate(shape, dtype, fmt)
+        if memory_obj is not None:
+            return memory_obj
+        if not busy_loop:
+            # TODO(Serapheim): print statistics about the allocation failure.
+            #                  both here and in the batched allocate() function.
+            # TODO(Serapheim): add prometheus statistics about the allocation failure.
+            logger.error(
+                "WekaGDS allocation failed and busy loop is disabled. Returning None."
+            )
+            return None
+
+        num_attempts = 0
+        logger.warning(
+            "WekaGDS allocation failed and busy loop is enabled. "
+            f"Waiting for {self.alloc_attempt_delay_secs} seconds before retrying."
+        )
+        while True:
+            time.sleep(self.alloc_attempt_delay_secs)
+
+            memory_obj = self.memory_allocator.allocate(shape, dtype, fmt)
+            if memory_obj is not None:
+                break
+            # TODO(Serapheim): print statistics about the allocation failure.
+            #                  both here and in the batched allocate() function.
+            # TODO(Serapheim): add prometheus statistics about the allocation failure.
+            num_attempts += 1
+            logger.warning(
+                f"Unable to allocate memory object after {num_attempts}"
+                " attempts of WekaGDS backend allocate()"
+            )
+            if num_attempts >= self.max_alloc_attempts:
+                logger.error(
+                    "WekaGDS allocation failed after "
+                    f"{self.max_alloc_attempts} attempts. Returning None."
+                )
+                return None
+        return memory_obj
+
+    @_lmcache_nvtx_annotate
+    def batched_allocate(
+        self,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        batch_size: int,
+        fmt: Optional[MemoryFormat] = None,
+        eviction: bool = True,
+        busy_loop: bool = True,
+    ) -> Optional[List[MemoryObj]]:
+        """
+        Batched allocate `batch_size` memory objects of shape and dtype
+        evict if necessary.
+        """
+        logger.debug(
+            f"Batched allocating memory in WekaGDS backend"
+            f" with busy loop: {busy_loop} with eviction: {eviction}"
+        )
+        if fmt is None:
+            if self.layerwise:
+                if self.enable_blending:
+                    fmt = MemoryFormat.KV_2TD
+                else:
+                    fmt = MemoryFormat.KV_T2D
+            else:
+                fmt = MemoryFormat.KV_2LTD
+
+        memory_objs = self.memory_allocator.batched_allocate(
+            shape, dtype, batch_size, fmt
+        )
+
+        if memory_objs is not None:
+            return memory_objs
+        if not busy_loop:
+            logger.error(
+                "WekaGDS batched allocation failed and "
+                "busy loop is disabled. Returning None."
+            )
+            return None
+
+        num_attempts = 0
+        logger.warning(
+            "WekaGDS batched allocation failed and busy loop is enabled. "
+            f"Waiting for {self.alloc_attempt_delay_secs} seconds before retrying."
+        )
+        while True:
+            time.sleep(self.alloc_attempt_delay_secs)
+
+            memory_objs = self.memory_allocator.batched_allocate(
+                shape, dtype, batch_size, fmt
+            )
+            if memory_objs:
+                break
+
+            num_attempts += 1
+            logger.debug(
+                f"Unable to allocate memory object after {num_attempts}"
+                " attempts of WekaGDS backend batched_allocate()"
+            )
+            if num_attempts >= self.max_alloc_attempts:
+                logger.error(
+                    "WekaGDS batched allocation failed after "
+                    f"{self.max_alloc_attempts} attempts. Returning None."
+                )
+                return None
+        return memory_objs
 
     def close(self) -> None:
         self.op_manager.shutdown()
