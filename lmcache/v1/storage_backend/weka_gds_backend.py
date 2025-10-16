@@ -920,6 +920,11 @@ class WekaGdsBackend(AllocatorBackendInterface):
                     "WekaGDS allocation failed after "
                     f"{self.max_alloc_attempts} attempts. Returning None."
                 )
+                if not self.memory_allocator.memcheck():
+                    logger.error(
+                        "WekaGDS allocation failed and memory allocator "
+                        "is inconsistent. This is a bug in the memory allocator."
+                    )
                 return None
         return memory_obj
 
@@ -987,6 +992,11 @@ class WekaGdsBackend(AllocatorBackendInterface):
                     "WekaGDS batched allocation failed after "
                     f"{self.max_alloc_attempts} attempts. Returning None."
                 )
+                if not self.memory_allocator.memcheck():
+                    logger.error(
+                        "WekaGDS batched allocation failed and memory allocator "
+                        "is inconsistent. This is a bug in the memory allocator."
+                    )
                 return None
         return memory_objs
 

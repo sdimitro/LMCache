@@ -1728,7 +1728,7 @@ def test_cufile_allocator_with_local_cpu_backend_eviction():
 
         try:
             memory_obj = storage_manager.allocate(
-                shape, dtype, fmt, eviction=True, busy_loop=False
+                shape, dtype, fmt, eviction=True, busy_loop=True
             )
             # If we reach here, the bug has been fixed
             print("SUCCESS: No AssertionError - the bug has been fixed!")
