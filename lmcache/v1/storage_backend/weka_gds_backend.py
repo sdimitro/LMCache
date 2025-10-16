@@ -268,7 +268,9 @@ class WekaGdsBackend(AllocatorBackendInterface):
         self._cufile_driver = self.cufile.CuFileDriver()
         assert hasattr(self.memory_allocator, "base_pointer")
         self.cufile_base_pointer = self.memory_allocator.base_pointer
-        asyncio.run_coroutine_threadsafe(self._scan_metadata(), self.loop)
+        self._scan_metadata_future = asyncio.run_coroutine_threadsafe(
+            self._scan_metadata(), self.loop
+        )
         self.save_metadata_tasks: set[asyncio.Task] = set()
 
     async def _scan_metadata(self):
@@ -989,6 +991,14 @@ class WekaGdsBackend(AllocatorBackendInterface):
         return memory_objs
 
     def close(self) -> None:
+        # Wait for metadata scanning to complete if it's still running
+        if hasattr(self, "_scan_metadata_future"):
+            try:
+                self._scan_metadata_future.result(timeout=10.0)
+                logger.info("Metadata scanning completed during close.")
+            except Exception as e:
+                logger.warning(f"Metadata scanning did not complete cleanly: {e}")
+
         self.op_manager.shutdown()
         self._thread_pool.shutdown(wait=True)
         logger.info("Weka backend closed.")

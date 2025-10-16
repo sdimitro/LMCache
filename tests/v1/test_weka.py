@@ -76,6 +76,9 @@ def create_test_memory_obj(
 
 def init_and_teardown(test_func):
     WEKA_DIR = "/mnt/weka/test-cache"
+    weka_backend = None
+    thread_loop = None
+    thread = None
     try:
         os.makedirs(WEKA_DIR, exist_ok=True)
         thread_loop = asyncio.new_event_loop()
@@ -85,9 +88,13 @@ def init_and_teardown(test_func):
         weka_backend = create_test_backend(create_test_config(), thread_loop)
         test_func(weka_backend)
     finally:
-        if thread_loop.is_running():
+        # Close the backend first to wait for any pending async tasks
+        if weka_backend is not None:
+            weka_backend.close()
+
+        if thread_loop is not None and thread_loop.is_running():
             thread_loop.call_soon_threadsafe(thread_loop.stop)
-        if thread.is_alive():
+        if thread is not None and thread.is_alive():
             thread.join()
         # We rmtree AFTER we ensure that the thread loop is done.
         # This way we don't hit any race conditions in rmtree()
