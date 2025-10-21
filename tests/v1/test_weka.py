@@ -1774,3 +1774,129 @@ def test_cufile_allocator_with_local_cpu_backend_eviction():
 
         if os.path.exists(WEKA_DIR):
             shutil.rmtree(WEKA_DIR, ignore_errors=True)
+
+
+def test_crash_handler_creates_dump_file():
+    """
+    Test that the LMCache crash handler creates a crash dump file
+    when an unhandled exception occurs.
+
+    This test verifies:
+    1. The crash handler is installed when lmcache is imported
+    2. A crash dump file is created on exception
+    3. The dump file contains proper exception information
+    4. The dump file is in the expected location with expected format
+    """
+    # Standard
+    import glob
+    import subprocess
+    import sys
+    import tempfile
+
+    # Get the initial list of crash dump files to exclude pre-existing ones
+    existing_dumps = set(glob.glob("/tmp/lmcache-report-*.dump.*"))
+
+    # Create a test script that will crash
+    test_script = '''
+import sys
+import lmcache  # This will install the crash handler
+
+def cause_crash():
+    """Function that will raise an exception"""
+    raise RuntimeError("Test crash from crash handler test")
+
+if __name__ == "__main__":
+    cause_crash()
+'''
+
+    # Write the test script to a temporary file
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        script_path = f.name
+        f.write(test_script)
+
+    try:
+        # Run the test script - it should crash and create a dump file
+        result = subprocess.run(
+            [sys.executable, script_path],
+            capture_output=True,
+            text=True,
+        )
+
+        # The script should have exited with non-zero status (crashed)
+        assert result.returncode != 0, "Test script should have crashed"
+
+        # Check that stderr contains the crash report notification
+        assert "[LMCache] Unhandled exception occurred!" in result.stderr, (
+            f"Expected crash notification in stderr, got: {result.stderr}"
+        )
+        assert "Crash report saved to:" in result.stderr, (
+            f"Expected crash report path in stderr, got: {result.stderr}"
+        )
+
+        # Find the newly created crash dump file
+        all_dumps = set(glob.glob("/tmp/lmcache-report-*.dump.*"))
+        new_dumps = all_dumps - existing_dumps
+
+        assert len(new_dumps) == 1, (
+            "Expected exactly 1 new crash dump file, found "
+            f"{len(new_dumps)}: {new_dumps}"
+        )
+
+        crash_dump_file = list(new_dumps)[0]
+
+        # Verify the crash dump file exists
+        assert os.path.exists(crash_dump_file), (
+            f"Crash dump file should exist at {crash_dump_file}"
+        )
+
+        # Read and verify the content of the crash dump file
+        with open(crash_dump_file, "r") as f:
+            dump_content = f.read()
+
+        # Verify the dump contains expected sections
+        assert "LMCache Crash Report" in dump_content, "Dump should contain header"
+        assert "PID:" in dump_content, "Dump should contain PID"
+        assert "LMCache Version:" in dump_content, "Dump should contain version info"
+        assert "Exception Type: RuntimeError" in dump_content, (
+            "Dump should contain exception type"
+        )
+        assert "Test crash from crash handler test" in dump_content, (
+            "Dump should contain exception message"
+        )
+        assert "Full Traceback:" in dump_content, (
+            "Dump should contain traceback section"
+        )
+        assert "cause_crash" in dump_content, (
+            "Dump should contain function name from traceback"
+        )
+        assert "System Information:" in dump_content, (
+            "Dump should contain system information"
+        )
+        assert "Python Version:" in dump_content, "Dump should contain Python version"
+
+        # Verify the file path format matches expected pattern
+        # Format: /tmp/lmcache-report-{pid}.dump.{timestamp}
+        # Standard
+        import re
+
+        pattern = r"/tmp/lmcache-report-\d+\.dump\.\d{8}_\d{6}"
+        assert re.match(pattern, crash_dump_file), (
+            f"Crash dump file path should match pattern {pattern},"
+            f" got {crash_dump_file}"
+        )
+
+        print(f"✓ Crash handler test passed! Dump file created at: {crash_dump_file}")
+        print(f"✓ Dump file size: {os.path.getsize(crash_dump_file)} bytes")
+
+    finally:
+        # Clean up the test script
+        if os.path.exists(script_path):
+            os.remove(script_path)
+
+        # Clean up any crash dump files created during this test
+        all_dumps = set(glob.glob("/tmp/lmcache-report-*.dump.*"))
+        new_dumps = all_dumps - existing_dumps
+        for dump_file in new_dumps:
+            if os.path.exists(dump_file):
+                os.remove(dump_file)
+                print(f"Cleaned up crash dump: {dump_file}")
