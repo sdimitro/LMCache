@@ -190,7 +190,7 @@ class WekaGdsBackend(AllocatorBackendInterface):
     `weka_path` and `cufile_buffer_size` in their LMCache config.
 
     Cache Directory Structure created by this Backend:
-    /{weka_path}/{first_level}/{second_level}/{data & metadata}
+    /{weka_path}/{metadata_dir}/{first_level}/{second_level}/{data & metadata}
     This structure is semi-arbitrary. WekaFS can handle/scale many small files
     into a single directory so we could just put all the data/metadata directly
     under the weka_path, but we create two levels in the directory hierarchy to
