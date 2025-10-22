@@ -235,6 +235,11 @@ class WekaGdsBackend(AllocatorBackendInterface):
             "Need to specify weka_path for WekaGdsBackend"
         )
         self.weka_path = config.weka_path
+        if self.layerwise:
+            # In order to avoid importing non-layerwise data when
+            # layerwise is enabled, and vice versa, we create a
+            # separate directory for layerwise data.
+            self.weka_path = os.path.join(self.weka_path, "layerwise")
         os.makedirs(self.weka_path, exist_ok=True)
 
         self.hot_lock = threading.Lock()
