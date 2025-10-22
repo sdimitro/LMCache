@@ -2084,3 +2084,157 @@ if __name__ == "__main__":
             if os.path.exists(dump_file):
                 os.remove(dump_file)
                 print(f"Cleaned up crash dump: {dump_file}")
+
+
+def test_scan_metadata_persistence():
+    """
+    Test that _scan_metadata() correctly loads metadata from disk after restart.
+    This validates the refactored _scan_metadata_subdir() and
+    _import_key_with_metadata() methods to ensure no regressions were introduced.
+    """
+    WEKA_DIR = "/mnt/weka/test-cache-scan-metadata"
+    weka_backend = None
+    thread_loop = None
+    thread = None
+
+    try:
+        # Clean up any existing test directory
+        if os.path.exists(WEKA_DIR):
+            shutil.rmtree(WEKA_DIR)
+
+        os.makedirs(WEKA_DIR, exist_ok=True)
+        thread_loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=thread_loop.run_forever)
+        thread.start()
+
+        # Create initial backend and test data
+        config = create_test_config(weka_path=WEKA_DIR)
+        weka_backend = create_test_backend(config, thread_loop)
+
+        # Create multiple keys with different characteristics
+        test_keys = [
+            create_test_key(chunk_hash=0xDEADBEEF),
+            create_test_key(chunk_hash=0xCAFEBABE),
+            create_test_key(chunk_hash=0xBADB0E),
+            create_test_key(chunk_hash=0x123456789ABCDEF0),
+            create_test_key(worker_id=1, chunk_hash=0xFEEDFACE),  # Different worker
+        ]
+
+        # Store memory objects for each key
+        memory_objs = [create_test_memory_obj(weka_backend) for _ in test_keys]
+
+        # Submit put tasks
+        weka_backend.batched_submit_put_task(test_keys, memory_objs)
+
+        # Wait for all put tasks to complete
+        timeout = 30.0
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            keys_still_pending = [
+                key for key in test_keys if weka_backend.exists_in_put_tasks(key)
+            ]
+            if not keys_still_pending:
+                break
+            time.sleep(0.1)
+        else:
+            raise TimeoutError("Put tasks did not complete within timeout")
+
+        # Verify all keys are in the cache
+        for key in test_keys:
+            assert weka_backend.contains(key, False), f"Key {key} should be in cache"
+
+        # Get the expected metadata for comparison
+        expected_metadata = {}
+        for key in test_keys:
+            metadata = weka_backend.hot_cache.get(key)
+            assert metadata is not None, f"Metadata for key {key} should exist"
+            expected_metadata[key] = {
+                "shape": metadata.shape,
+                "dtype": metadata.dtype,
+                "size": metadata.size,
+                "fmt": metadata.fmt,
+            }
+
+        # Close the backend to simulate shutdown
+        initial_cache_size = len(weka_backend.hot_cache)
+        weka_backend.close()
+        weka_backend = None
+
+        # Give time for async cleanup
+        time.sleep(0.5)
+
+        # Create a new backend - this will trigger _scan_metadata()
+        weka_backend = create_test_backend(config, thread_loop)
+
+        # Wait for scan_metadata to complete
+        scan_future = weka_backend._scan_metadata_future
+        assert scan_future is not None, "Scan metadata future should exist"
+        scan_future.result(timeout=30.0)
+
+        # Verify the cache was repopulated from disk
+        assert len(weka_backend.hot_cache) == initial_cache_size, (
+            f"Expected {initial_cache_size} entries, got {len(weka_backend.hot_cache)}"
+        )
+
+        # Verify all keys are still accessible
+        for key in test_keys:
+            assert weka_backend.contains(key, False), (
+                f"Key {key} should be in cache after restart"
+            )
+
+        # Verify metadata was correctly loaded
+        for key, expected in expected_metadata.items():
+            metadata = weka_backend.hot_cache.get(key)
+            assert metadata is not None, (
+                f"Metadata for key {key} should exist after restart"
+            )
+            assert metadata.shape == expected["shape"], (
+                f"Shape mismatch for {key}: expected {expected['shape']}, "
+                f"got {metadata.shape}"
+            )
+            assert metadata.dtype == expected["dtype"], (
+                f"Dtype mismatch for {key}: expected {expected['dtype']}, "
+                f"got {metadata.dtype}"
+            )
+            assert metadata.size == expected["size"], (
+                f"Size mismatch for {key}: expected {expected['size']}, "
+                f"got {metadata.size}"
+            )
+            # Note: fmt might be None initially but gets set correctly during reload
+            # For non-layerwise mode, it should be KV_2LTD after reload
+            assert metadata.fmt == MemoryFormat.KV_2LTD, (
+                f"Format should be KV_2LTD for non-layerwise mode, got {metadata.fmt}"
+            )
+
+        # Verify we can actually read the data
+        retrieved_objs = weka_backend.batched_get_blocking(test_keys)
+        assert len(retrieved_objs) == len(test_keys), "Should retrieve all objects"
+
+        for retrieved_obj, original_obj in zip(
+            retrieved_objs, memory_objs, strict=True
+        ):
+            assert retrieved_obj is not None, "Retrieved object should not be None"
+            assert retrieved_obj.get_size() == original_obj.get_size(), (
+                "Size should match"
+            )
+            assert retrieved_obj.get_shape() == original_obj.get_shape(), (
+                "Shape should match"
+            )
+            assert retrieved_obj.get_dtype() == original_obj.get_dtype(), (
+                "Dtype should match"
+            )
+
+        print(f"✓ Successfully scanned and loaded {len(test_keys)} entries from disk")
+
+    finally:
+        # Cleanup
+        if weka_backend is not None:
+            weka_backend.close()
+
+        if thread_loop is not None and thread_loop.is_running():
+            thread_loop.call_soon_threadsafe(thread_loop.stop)
+        if thread is not None and thread.is_alive():
+            thread.join()
+
+        if os.path.exists(WEKA_DIR):
+            shutil.rmtree(WEKA_DIR, ignore_errors=True)
