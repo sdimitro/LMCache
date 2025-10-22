@@ -18,6 +18,7 @@ import aiofile
 import torch
 
 # First Party
+from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import init_logger
 from lmcache.utils import (
     CacheEngineKey,
@@ -211,6 +212,7 @@ class WekaGdsBackend(AllocatorBackendInterface):
     def __init__(
         self,
         config: LMCacheEngineConfig,
+        metadata: LMCacheEngineMetadata,
         loop: asyncio.AbstractEventLoop,
         memory_allocator: MemoryAllocatorInterface,
         dst_device: str = "cuda",
@@ -234,12 +236,24 @@ class WekaGdsBackend(AllocatorBackendInterface):
         assert config.weka_path is not None, (
             "Need to specify weka_path for WekaGdsBackend"
         )
-        self.weka_path = config.weka_path
+        # Construct a descriptive directory name based on metadata
+        # Format:
+        # {model_name}-{world_size}-{fmt}-{kv_dtype}-{kv_shape}-{worker_id}[-layerwise]
+        dtype_str = str(metadata.kv_dtype).replace("torch.", "")
+        shape_str = "x".join(map(str, metadata.kv_shape))
+        dir_components = [
+            # Replace / in model names like "meta/Llama-2-7b"
+            metadata.model_name.replace("/", "_"),
+            str(metadata.world_size),
+            metadata.fmt,
+            dtype_str,
+            shape_str,
+            str(metadata.worker_id),
+        ]
         if self.layerwise:
-            # In order to avoid importing non-layerwise data when
-            # layerwise is enabled, and vice versa, we create a
-            # separate directory for layerwise data.
-            self.weka_path = os.path.join(self.weka_path, "layerwise")
+            dir_components.append("layerwise")
+        metadata_dir = "-".join(dir_components)
+        self.weka_path = os.path.join(config.weka_path, metadata_dir)
         os.makedirs(self.weka_path, exist_ok=True)
 
         self.hot_lock = threading.Lock()

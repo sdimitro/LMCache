@@ -11,6 +11,7 @@ import unittest.mock
 import torch
 
 # First Party
+from lmcache.config import LMCacheEngineMetadata
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import CuFileMemoryAllocator, MemoryFormat, MemoryObj
@@ -52,8 +53,19 @@ def create_test_key(
 def create_test_backend(
     config: LMCacheEngineConfig, loop: asyncio.AbstractEventLoop
 ) -> WekaGdsBackend:
+    # Create test metadata
+    metadata = LMCacheEngineMetadata(
+        model_name="meta-llama/Llama-3.1-70B-Instruct",
+        world_size=8,
+        worker_id=0,
+        fmt="vllm",
+        kv_dtype=torch.bfloat16,
+        kv_shape=(80, 2, 256, 8, 128),
+    )
+
     weka_backend = WekaGdsBackend(
         config,
+        metadata,
         loop,
         CuFileMemoryAllocator(config.cufile_buffer_size * 1024**2),
         dst_device="cuda:0",
@@ -1774,6 +1786,178 @@ def test_cufile_allocator_with_local_cpu_backend_eviction():
 
         if os.path.exists(WEKA_DIR):
             shutil.rmtree(WEKA_DIR, ignore_errors=True)
+
+
+def test_weka_backend_directory_path_generation():
+    """
+    Test that WekaGdsBackend generates the correct directory path based on metadata.
+
+    The path format should be:
+    {weka_path}/{model_name}-{world_size}-{fmt}-{kv_dtype}-{kv_shape}-{worker_id}[-layerwise]
+    """
+    base_weka_path = "/mnt/weka/test-cache-path-gen"
+
+    # Test Case 1: Standard vLLM configuration (non-layerwise)
+    metadata1 = LMCacheEngineMetadata(
+        model_name="meta-llama/Llama-2-7b-hf",
+        world_size=8,
+        worker_id=0,
+        fmt="vllm",
+        kv_dtype=torch.bfloat16,
+        kv_shape=(32, 2, 256, 4, 128),
+    )
+
+    config1 = LMCacheEngineConfig.from_defaults(
+        chunk_size=256,
+        weka_path=base_weka_path,
+        lmcache_instance_id="test_path_gen_1",
+        cufile_buffer_size=128,
+        use_layerwise=False,
+        extra_config={"gds_io_threads": 4},
+    )
+
+    thread_loop1 = asyncio.new_event_loop()
+    thread1 = threading.Thread(target=thread_loop1.run_forever)
+    thread1.start()
+
+    expected_path1 = os.path.join(
+        base_weka_path, "meta-llama_Llama-2-7b-hf-8-vllm-bfloat16-32x2x256x4x128-0"
+    )
+
+    try:
+        backend1 = WekaGdsBackend(
+            config1,
+            metadata1,
+            thread_loop1,
+            CuFileMemoryAllocator(128 * 1024**2),
+            dst_device="cuda:0",
+        )
+
+        assert backend1.weka_path == expected_path1, (
+            f"Expected path: {expected_path1}, got: {backend1.weka_path}"
+        )
+        print(f"✓ Test case 1 passed: {backend1.weka_path}")
+
+        backend1.close()
+    finally:
+        if thread_loop1.is_running():
+            thread_loop1.call_soon_threadsafe(thread_loop1.stop)
+        if thread1.is_alive():
+            thread1.join(timeout=5.0)
+        thread_loop1.close()
+        if os.path.exists(expected_path1):
+            shutil.rmtree(expected_path1, ignore_errors=True)
+
+    # Test Case 2: With layerwise enabled
+    metadata2 = LMCacheEngineMetadata(
+        model_name="meta-llama/Llama-2-7b-hf",
+        world_size=8,
+        worker_id=3,
+        fmt="vllm",
+        kv_dtype=torch.bfloat16,
+        kv_shape=(32, 2, 256, 4, 128),
+    )
+
+    config2 = LMCacheEngineConfig.from_defaults(
+        chunk_size=256,
+        weka_path=base_weka_path,
+        lmcache_instance_id="test_path_gen_2",
+        cufile_buffer_size=128,
+        use_layerwise=True,
+        extra_config={"gds_io_threads": 4},
+    )
+
+    thread_loop2 = asyncio.new_event_loop()
+    thread2 = threading.Thread(target=thread_loop2.run_forever)
+    thread2.start()
+
+    expected_path2 = os.path.join(
+        base_weka_path,
+        "meta-llama_Llama-2-7b-hf-8-vllm-bfloat16-32x2x256x4x128-3-layerwise",
+    )
+
+    try:
+        backend2 = WekaGdsBackend(
+            config2,
+            metadata2,
+            thread_loop2,
+            CuFileMemoryAllocator(128 * 1024**2),
+            dst_device="cuda:0",
+        )
+
+        assert backend2.weka_path == expected_path2, (
+            f"Expected path: {expected_path2}, got: {backend2.weka_path}"
+        )
+        print(f"✓ Test case 2 passed: {backend2.weka_path}")
+
+        backend2.close()
+    finally:
+        if thread_loop2.is_running():
+            thread_loop2.call_soon_threadsafe(thread_loop2.stop)
+        if thread2.is_alive():
+            thread2.join(timeout=5.0)
+        thread_loop2.close()
+        if os.path.exists(expected_path2):
+            shutil.rmtree(expected_path2, ignore_errors=True)
+
+    # Test Case 3: With MLA (shape has 1 instead of 2)
+    metadata3 = LMCacheEngineMetadata(
+        model_name="deepseek-ai/DeepSeek-V2",
+        world_size=4,
+        worker_id=1,
+        fmt="vllm",
+        kv_dtype=torch.float16,
+        kv_shape=(60, 1, 256, 16, 64),
+        use_mla=True,
+    )
+
+    config3 = LMCacheEngineConfig.from_defaults(
+        chunk_size=256,
+        weka_path=base_weka_path,
+        lmcache_instance_id="test_path_gen_3",
+        cufile_buffer_size=128,
+        use_layerwise=True,
+        extra_config={"gds_io_threads": 4},
+    )
+
+    thread_loop3 = asyncio.new_event_loop()
+    thread3 = threading.Thread(target=thread_loop3.run_forever)
+    thread3.start()
+
+    expected_path3 = os.path.join(
+        base_weka_path,
+        "deepseek-ai_DeepSeek-V2-4-vllm-float16-60x1x256x16x64-1-layerwise",
+    )
+
+    try:
+        backend3 = WekaGdsBackend(
+            config3,
+            metadata3,
+            thread_loop3,
+            CuFileMemoryAllocator(128 * 1024**2),
+            dst_device="cuda:0",
+        )
+
+        assert backend3.weka_path == expected_path3, (
+            f"Expected path: {expected_path3}, got: {backend3.weka_path}"
+        )
+        print(f"✓ Test case 3 passed: {backend3.weka_path}")
+
+        backend3.close()
+    finally:
+        if thread_loop3.is_running():
+            thread_loop3.call_soon_threadsafe(thread_loop3.stop)
+        if thread3.is_alive():
+            thread3.join(timeout=5.0)
+        thread_loop3.close()
+        if os.path.exists(expected_path3):
+            shutil.rmtree(expected_path3, ignore_errors=True)
+
+    # Clean up base directory
+    if os.path.exists(base_weka_path):
+        shutil.rmtree(base_weka_path, ignore_errors=True)
+
+    print("✓ All directory path generation tests passed!")
 
 
 def test_crash_handler_creates_dump_file():

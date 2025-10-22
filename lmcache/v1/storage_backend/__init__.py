@@ -176,7 +176,9 @@ def CreateStorageBackends(
         storage_backends[backend_name] = local_disk_backend
 
     if config.weka_path is not None:
-        weka_backend = WekaGdsBackend(config, loop, memory_allocator, dst_device)
+        weka_backend = WekaGdsBackend(
+            config, metadata, loop, memory_allocator, dst_device
+        )
         # TODO(Serapheim): there's a chance we don't want the local
         # CPU cache in front of ours. Let's experiment and potentially
         # change that in the future.
