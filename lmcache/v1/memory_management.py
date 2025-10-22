@@ -648,9 +648,19 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
 
     ALIGN_BYTES = 4096
 
-    def __init__(self, tensor: torch.Tensor, align_bytes: int = ALIGN_BYTES):
+    def __init__(
+        self,
+        tensor: torch.Tensor,
+        align_bytes: int = ALIGN_BYTES,
+        parent_for_objects: Optional[MemoryAllocatorInterface] = None,
+    ):
         self.buffer = tensor.view(torch.uint8).flatten()
         self.align_bytes = align_bytes
+        # Parent allocator to use for created memory objects (for proper locking)
+        # If None, defaults to self (for direct usage without wrapper)
+        self._parent_for_objects = (
+            parent_for_objects if parent_for_objects is not None else self
+        )
 
         self.explicit_list = sortedcontainers.SortedList(key=lambda x: x.start)
 
@@ -767,7 +777,7 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
             metadata=MemoryObjMetadata(
                 shape, dtype, block.start, aligned_size, 1, False, fmt
             ),
-            parent_allocator=self,
+            parent_allocator=self._parent_for_objects,
         )
 
     @_lmcache_nvtx_annotate
@@ -833,6 +843,7 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
             self.buffer[block.start : block.start + total_aligned_size],
             batch_size,
         )
+
         tensor_mem_objs = []
         temp_start = block.start
         for raw_data in raw_datas:
@@ -842,7 +853,7 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
                     metadata=MemoryObjMetadata(
                         shape, dtype, temp_start, unit_aligned_size, 1, False, fmt
                     ),
-                    parent_allocator=self,
+                    parent_allocator=self._parent_for_objects,
                 )
             )
             temp_start += unit_aligned_size
@@ -1394,7 +1405,7 @@ class PinMemoryAllocator(MemoryAllocatorInterface):
                 fmt=kwargs["fmt"],
             )
         else:
-            self.allocator = TensorMemoryAllocator(self.buffer)
+            self.allocator = TensorMemoryAllocator(self.buffer, parent_for_objects=self)
 
         self.host_mem_lock = threading.Lock() if not use_paging else nullcontext()
 
@@ -1498,7 +1509,9 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
                 fmt=kwargs["fmt"],
             )
         else:
-            self.pin_allocator = TensorMemoryAllocator(self.buffer)
+            self.pin_allocator = TensorMemoryAllocator(
+                self.buffer, parent_for_objects=self
+            )
 
         self.host_mem_lock = threading.Lock() if not use_paging else nullcontext()
 
@@ -1640,7 +1653,9 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
             kwargs = {}
             if align_bytes is not None:
                 kwargs["align_bytes"] = align_bytes
-            self.allocator = TensorMemoryAllocator(self.tensor, **kwargs)
+            self.allocator = TensorMemoryAllocator(
+                self.tensor, parent_for_objects=self, **kwargs
+            )
 
         self.device_mem_lock = threading.Lock() if not use_paging else nullcontext()
 
