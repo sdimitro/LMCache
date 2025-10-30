@@ -21,7 +21,7 @@ import torch
 
 # First Party
 from lmcache.config import LMCacheEngineMetadata
-from lmcache.logging import init_logger
+from lmcache.logging import get_loguru, init_logger
 from lmcache.observability import LMCacheStatsLogger, LMCStatsMonitor
 from lmcache.usage_context import InitializeUsageContext
 from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
@@ -59,6 +59,7 @@ from lmcache.v1.token_database import (
 )
 
 logger = init_logger(__name__)
+nu_logger = get_loguru()
 
 
 class CacheEngineEndSignal:
@@ -92,7 +93,7 @@ class LMCacheEngine:
         broadcast_fn: Callable[[torch.Tensor, int], None],
         broadcast_object_fn: Callable[[Any, int], Any],
     ):
-        logger.info(f"Creating LMCacheEngine with config: {config}")
+        nu_logger.info(f"Creating LMCacheEngine with config: {config}")
         self.config = config
         self.metadata = metadata
         self.memory_allocator = memory_allocator
@@ -279,7 +280,7 @@ class LMCacheEngine:
                 busy_loop=self.force_store_wait,
             )
             if memory_obj is None:
-                logger.warning(
+                nu_logger.warning(
                     "Memory allocator under pressure so"
                     " choosing to not store the KV cache."
                 )
@@ -388,7 +389,7 @@ class LMCacheEngine:
             )
 
             if memory_objs_multi_layer is None:
-                logger.warning(
+                nu_logger.warning(
                     "Memory allocator under pressure so"
                     " choosing to not store the KV cache."
                 )
@@ -890,7 +891,7 @@ class LMCacheEngine:
         event_id: str,
     ) -> int:
         if method not in ["cachegen"]:
-            logger.warning(f"Unsupported compression method: {method}.")
+            nu_logger.warning(f"Unsupported compression method: {method}.")
             return 0
 
         # First Party
@@ -945,7 +946,7 @@ class LMCacheEngine:
         event_id: str,
     ) -> int:
         if method not in ["cachegen"]:
-            logger.warning(f"Unsupported decompression method: {method}.")
+            nu_logger.warning(f"Unsupported decompression method: {method}.")
             return 0
 
         # First Party
@@ -1201,7 +1202,7 @@ class LMCacheEngine:
 
             for (key, start, end), memory_obj in zip(blocks, memory_objs, strict=False):
                 if memory_obj is None:
-                    logger.warning(
+                    nu_logger.warning(
                         "The cache block is in the storage, but it can't be retrieved"
                     )
                     if (
@@ -1268,7 +1269,7 @@ class LMCacheEngine:
             # Receive total chunk count
             chunk_count = self.broadcast_object_fn(None, self.metadata.first_rank)
             if chunk_count is None:
-                logger.warning(
+                nu_logger.warning(
                     f"rank={self.metadata.worker_id} received None chunk_count"
                 )
                 return
@@ -1280,7 +1281,7 @@ class LMCacheEngine:
                     None, self.metadata.first_rank
                 )
                 if combined_metadata is None:
-                    logger.warning(
+                    nu_logger.warning(
                         f"rank={self.metadata.worker_id} "
                         "received None combined_metadata"
                     )

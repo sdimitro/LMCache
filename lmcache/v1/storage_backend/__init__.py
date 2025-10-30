@@ -10,7 +10,7 @@ import torch
 
 # First Party
 from lmcache.config import LMCacheEngineMetadata
-from lmcache.logging import init_logger
+from lmcache.logging import get_loguru
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.lookup_server import LookupServerInterface
 from lmcache.v1.memory_management import (
@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     # First Party
     from lmcache.v1.cache_controller.worker import LMCacheWorker
 
-logger = init_logger(__name__)
+logger = get_loguru()
 
 
 def create_dynamic_backends(

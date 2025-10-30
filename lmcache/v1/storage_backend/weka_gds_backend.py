@@ -19,7 +19,7 @@ import torch
 
 # First Party
 from lmcache.config import LMCacheEngineMetadata
-from lmcache.logging import init_logger
+from lmcache.logging import get_loguru, init_logger
 from lmcache.utils import (
     CacheEngineKey,
     DiskCacheMetadata,
@@ -38,6 +38,7 @@ from lmcache.v1.storage_backend.abstract_backend import (
 )
 
 logger = init_logger(__name__)
+nu_logger = get_loguru()
 
 
 class OperationTimeoutError(Exception):
@@ -78,7 +79,7 @@ class OperationManager:
             if os.path.exists(self._reset_file):
                 os.remove(self._reset_file)
                 self.reset_failure_count()
-                logger.info(
+                nu_logger.info(
                     f"Resetting operation manager failure count due to reset file "
                     f"{self._reset_file}"
                 )
@@ -315,7 +316,7 @@ class WekaGdsBackend(AllocatorBackendInterface):
         # TODO(Serapheim): If Python 3.11+, can we use TaskGroup instead?
         await asyncio.gather(*tasks)
         end = time.perf_counter()
-        logger.info(
+        nu_logger.info(
             f"Read {len(self.hot_cache)} cache entries from persistent "
             f"storage in {end - start:.2f} seconds"
         )
@@ -343,7 +344,7 @@ class WekaGdsBackend(AllocatorBackendInterface):
                             else:
                                 key = CacheEngineKey.from_string(key_str)
                         except ValueError as e:
-                            logger.error(
+                            nu_logger.error(
                                 f"Filename {filename} can't be converted "
                                 f"back into cache key: {e}"
                             )
@@ -353,7 +354,7 @@ class WekaGdsBackend(AllocatorBackendInterface):
                                 key, fentry.path, l1_dir + l2_dir
                             )
                         except UnsupportedMetadataVersion:
-                            logger.error(
+                            nu_logger.error(
                                 "Unsupported metadata version for "
                                 f"{fentry.path}, ignoring"
                             )
@@ -419,7 +420,7 @@ class WekaGdsBackend(AllocatorBackendInterface):
                     f"Ignoring cache entry for key {key}."
                 )
             except Exception as e:
-                logger.error(
+                nu_logger.error(
                     f"Unexpected error reading metadata file {path}: "
                     f"{type(e).__name__}: {e}. Ignoring cache entry for key {key}."
                 )
@@ -496,7 +497,7 @@ class WekaGdsBackend(AllocatorBackendInterface):
                 memory_obj.metadata.address,
             )
         except Exception as e:
-            logger.error(
+            nu_logger.error(
                 f"GDS/cuFile write operation failed for key {key} at path {path}: "
                 f"tensor_shape={kv_chunk.shape}, tensor_dtype={kv_chunk.dtype}, "
                 f"tensor_size_bytes={kv_chunk.nbytes}, error={e}",
@@ -516,7 +517,7 @@ class WekaGdsBackend(AllocatorBackendInterface):
             self.save_metadata_tasks.add(task)
             task.add_done_callback(self.save_metadata_tasks.discard)
         except Exception as e:
-            logger.error(
+            nu_logger.error(
                 f"POSIX metadata write operation failed for key {key} at path "
                 f"{path + _METADATA_FILE_SUFFIX}: metadata_size_bytes={len(metadata)}, "
                 f"tmp_suffix={tmp}, error={e}",
@@ -568,13 +569,13 @@ class WekaGdsBackend(AllocatorBackendInterface):
                 key,
             )
         except OperationHangThresholdReached:
-            logger.error(
+            nu_logger.error(
                 "Get blocking hang threshold reached. Will not run operation",
                 exc_info=True,
             )
             return None
         except OperationTimeoutError:
-            logger.error(
+            nu_logger.error(
                 f"Get blocking timed out after {self.timeout_get_blocking} seconds",
                 exc_info=True,
             )
@@ -612,7 +613,7 @@ class WekaGdsBackend(AllocatorBackendInterface):
         )
         if ret != logical_size:
             if ret < 0:
-                logger.error(
+                nu_logger.error(
                     f"Error loading {path}: ret: {ret} removing entry from cache"
                 )
                 with self.hot_lock:
@@ -620,7 +621,7 @@ class WekaGdsBackend(AllocatorBackendInterface):
             else:
                 # TODO(Serapheim): we should probably count errors and
                 # remove the entry if it's a persistent problem.
-                logger.error(
+                nu_logger.error(
                     f"Error loading {path}: got only {ret} bytes "
                     f"out of {logical_size}, ignoring"
                 )
@@ -656,7 +657,7 @@ class WekaGdsBackend(AllocatorBackendInterface):
 
         memory_obj = self.memory_allocator.allocate(shape, dtype, fmt)
         if memory_obj is None:
-            logger.error("Memory allocation failed during sync disk load.")
+            nu_logger.error("Memory allocation failed during sync disk load.")
             return None
 
         return self._load_bytes_from_disk_with_memory(key, path, memory_obj)
@@ -673,13 +674,13 @@ class WekaGdsBackend(AllocatorBackendInterface):
                 len(keys),
             )
         except OperationHangThresholdReached:
-            logger.error(
+            nu_logger.error(
                 "Batched get blocking hang threshold reached. Will not run operation",
                 exc_info=True,
             )
             return [None] * len(keys)
         except OperationTimeoutError:
-            logger.error(
+            nu_logger.error(
                 f"Batched get blocking timed out after "
                 f"{self.timeout_batched_get_blocking} seconds",
                 exc_info=True,
@@ -697,7 +698,7 @@ class WekaGdsBackend(AllocatorBackendInterface):
             for key in keys:
                 entry = self.hot_cache.get(key)
                 if entry is None:
-                    logger.error(f"Lookup failed during get_blocking for {key}")
+                    nu_logger.error(f"Lookup failed during get_blocking for {key}")
                     paths.append(None)
                     dtypes.append(None)
                     shapes.append(None)
@@ -720,7 +721,9 @@ class WekaGdsBackend(AllocatorBackendInterface):
                 continue
             memory_obj = self.memory_allocator.allocate(shape, dtype, fmt)
             if memory_obj is None:
-                logger.error(f"Memory allocation failed during get_blocking for {path}")
+                nu_logger.error(
+                    f"Memory allocation failed during get_blocking for {path}"
+                )
             else:
                 gds_reads += 1
                 gds_read_bytes += memory_obj.get_size()
@@ -772,7 +775,7 @@ class WekaGdsBackend(AllocatorBackendInterface):
                     addr, kv_chunk.nbytes, file_offset=offset, dev_offset=dev_offset
                 )
         except Exception as e:
-            logger.error(f"Error saving {tmp_path}: {e}", exc_info=True)
+            nu_logger.error(f"Error saving {tmp_path}: {e}", exc_info=True)
             raise e
         os.rename(tmp_path, path)
         return metadata
@@ -795,7 +798,7 @@ class WekaGdsBackend(AllocatorBackendInterface):
                     dev_offset=dev_offset,
                 )
         except Exception as e:
-            logger.error(f"CuFile read failed for {file_path}: {e}", exc_info=True)
+            nu_logger.error(f"CuFile read failed for {file_path}: {e}", exc_info=True)
             return -1
 
     def pin(self, key: CacheEngineKey) -> bool:
@@ -820,13 +823,13 @@ class WekaGdsBackend(AllocatorBackendInterface):
             if read_from_disk:
                 return True
         except OperationHangThresholdReached:
-            logger.error(
+            nu_logger.error(
                 "Contains hang threshold reached. Will not run operation",
                 exc_info=True,
             )
             return False
         except OperationTimeoutError:
-            logger.error(
+            nu_logger.error(
                 f"Contains timed out after {self.timeout_contains} seconds",
                 exc_info=True,
             )
@@ -928,13 +931,13 @@ class WekaGdsBackend(AllocatorBackendInterface):
             # TODO(Serapheim): print statistics about the allocation failure.
             #                  both here and in the batched allocate() function.
             # TODO(Serapheim): add prometheus statistics about the allocation failure.
-            logger.error(
+            nu_logger.error(
                 "WekaGDS allocation failed and busy loop is disabled. Returning None."
             )
             return None
 
         num_attempts = 0
-        logger.warning(
+        nu_logger.warning(
             "WekaGDS allocation failed and busy loop is enabled. "
             f"Waiting for {self.alloc_attempt_delay_secs} seconds before retrying."
         )
@@ -948,17 +951,17 @@ class WekaGdsBackend(AllocatorBackendInterface):
             #                  both here and in the batched allocate() function.
             # TODO(Serapheim): add prometheus statistics about the allocation failure.
             num_attempts += 1
-            logger.warning(
+            nu_logger.warning(
                 f"Unable to allocate memory object after {num_attempts}"
                 " attempts of WekaGDS backend allocate()"
             )
             if num_attempts >= self.max_alloc_attempts:
-                logger.error(
+                nu_logger.error(
                     "WekaGDS allocation failed after "
                     f"{self.max_alloc_attempts} attempts. Returning None."
                 )
                 if not self.memory_allocator.memcheck():
-                    logger.error(
+                    nu_logger.error(
                         "WekaGDS allocation failed and memory allocator "
                         "is inconsistent. This is a bug in the memory allocator."
                     )
@@ -999,14 +1002,14 @@ class WekaGdsBackend(AllocatorBackendInterface):
         if memory_objs is not None:
             return memory_objs
         if not busy_loop:
-            logger.error(
+            nu_logger.error(
                 "WekaGDS batched allocation failed and "
                 "busy loop is disabled. Returning None."
             )
             return None
 
         num_attempts = 0
-        logger.warning(
+        nu_logger.warning(
             "WekaGDS batched allocation failed and busy loop is enabled. "
             f"Waiting for {self.alloc_attempt_delay_secs} seconds before retrying."
         )
@@ -1025,12 +1028,12 @@ class WekaGdsBackend(AllocatorBackendInterface):
                 " attempts of WekaGDS backend batched_allocate()"
             )
             if num_attempts >= self.max_alloc_attempts:
-                logger.error(
+                nu_logger.error(
                     "WekaGDS batched allocation failed after "
                     f"{self.max_alloc_attempts} attempts. Returning None."
                 )
                 if not self.memory_allocator.memcheck():
-                    logger.error(
+                    nu_logger.error(
                         "WekaGDS batched allocation failed and memory allocator "
                         "is inconsistent. This is a bug in the memory allocator."
                     )
@@ -1042,10 +1045,10 @@ class WekaGdsBackend(AllocatorBackendInterface):
         if hasattr(self, "_scan_metadata_future"):
             try:
                 self._scan_metadata_future.result(timeout=10.0)
-                logger.info("Metadata scanning completed during close.")
+                nu_logger.info("Metadata scanning completed during close.")
             except Exception as e:
-                logger.warning(f"Metadata scanning did not complete cleanly: {e}")
+                nu_logger.warning(f"Metadata scanning did not complete cleanly: {e}")
 
         self.op_manager.shutdown()
         self._thread_pool.shutdown(wait=True)
-        logger.info("Weka backend closed.")
+        nu_logger.info("Weka backend closed.")

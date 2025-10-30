@@ -9,10 +9,10 @@ import re
 import yaml
 
 # First Party
-from lmcache.logging import init_logger
+from lmcache.logging import get_loguru
 import lmcache.config as orig_config
 
-logger = init_logger(__name__)
+logger = get_loguru()
 
 
 def _parse_local_disk(local_disk) -> Optional[str]:
@@ -604,8 +604,8 @@ def _update_config_from_env(self):
                 value = resolved_config[name]
                 converted_value = config["env_converter"](value)
                 setattr(self, name, converted_value)
-            except (ValueError, json.JSONDecodeError) as e:
-                logger.warning(f"Failed to parse {get_env_name(name)}: {e}")
+            except (ValueError, json.JSONDecodeError):
+                logger.exception(f"Failed to parse {get_env_name(name)}")
                 # Keep existing value if conversion fails
 
     return self
@@ -641,8 +641,8 @@ def _from_json(cls, json_str: str):
     try:
         config_dict = json.loads(json_str)
         return cls.from_dict(config_dict)
-    except json.JSONDecodeError as e:
-        logger.error(f"Invalid JSON input: {e}")
+    except json.JSONDecodeError:
+        logger.exception("Invalid JSON input")
         raise
 
 

@@ -15,12 +15,12 @@ import sortedcontainers
 import torch
 
 # First Party
-from lmcache.logging import init_logger
+from lmcache.logging import get_loguru
 from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import _lmcache_nvtx_annotate
 import lmcache.c_ops as lmc_ops
 
-logger = init_logger(__name__)
+logger = get_loguru()
 
 
 class MemoryFormat(Enum):
