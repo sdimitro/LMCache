@@ -243,9 +243,7 @@ def test_zero_division_protection(stats_monitor):
 
 
 def test_backend_specific_lookup_metrics(stats_monitor):
-    # Test per-backend lookup metrics
     stats_monitor.on_lookup_request(num_tokens=100)
-    # Single call with backend breakdown
     backend_hits = {"LocalCPUBackend": 60, "WekaGdsBackend": 40}
     stats_monitor.on_lookup_finished(num_hit_tokens=100, backend_hits=backend_hits)
 
@@ -258,9 +256,7 @@ def test_backend_specific_lookup_metrics(stats_monitor):
 
 
 def test_backend_specific_retrieve_metrics(stats_monitor):
-    # Test per-backend retrieve metrics
     request_id = stats_monitor.on_retrieve_request(num_tokens=150)
-    # Single call with backend breakdown
     backend_tokens = {"LocalCPUBackend": 90, "LocalDiskBackend": 60}
     stats_monitor.on_retrieve_finished(
         request_id=request_id, retrieved_tokens=150, backend_tokens=backend_tokens
@@ -292,3 +288,43 @@ def test_backend_specific_store_metrics(stats_monitor):
         "LocalDiskBackend": 200,
         "RemoteBackend": 200,
     }
+
+
+def test_backend_latency_metrics(stats_monitor):
+    # Test per-backend latency tracking
+
+    # Test retrieve latencies
+    request_id = stats_monitor.on_retrieve_request(num_tokens=150)
+    backend_tokens = {"LocalCPUBackend": 150}
+    retrieve_latencies = {"LocalCPUBackend": 2.3, "LocalDiskBackend": 15.8}
+    stats_monitor.on_retrieve_finished(
+        request_id=request_id,
+        retrieved_tokens=150,
+        backend_tokens=backend_tokens,
+        backend_latencies=retrieve_latencies,
+    )
+
+    # Test store latencies
+    store_id = stats_monitor.on_store_request(num_tokens=200)
+    backends_used = ["LocalCPUBackend", "RemoteBackend"]
+    store_latencies = {"LocalCPUBackend": 3.1, "RemoteBackend": 25.6}
+    stats_monitor.on_store_finished(
+        request_id=store_id,
+        num_tokens=200,
+        backends=backends_used,
+        backend_latencies=store_latencies,
+    )
+
+    stats = stats_monitor.get_stats_and_clear()
+
+    # Check get latencies were recorded
+    assert "LocalCPUBackend" in stats.backend_get_latencies
+    assert "LocalDiskBackend" in stats.backend_get_latencies
+    assert stats.backend_get_latencies["LocalCPUBackend"] == [2.3]
+    assert stats.backend_get_latencies["LocalDiskBackend"] == [15.8]
+
+    # Check put latencies were recorded
+    assert "LocalCPUBackend" in stats.backend_put_latencies
+    assert "RemoteBackend" in stats.backend_put_latencies
+    assert stats.backend_put_latencies["LocalCPUBackend"] == [3.1]
+    assert stats.backend_put_latencies["RemoteBackend"] == [25.6]

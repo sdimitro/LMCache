@@ -302,7 +302,7 @@ class LMCacheEngine:
         t = time.perf_counter()
 
         transfer_spec = kwargs.get("transfer_spec", None)
-        backends_used = self.storage_manager.batched_put(
+        backend_latencies = self.storage_manager.batched_put(
             keys, memory_objs, transfer_spec=transfer_spec
         )
         put_time += time.perf_counter() - t
@@ -321,8 +321,13 @@ class LMCacheEngine:
             put_time * 1000,
         )
 
+        # Derive backends from latencies keys
+        backends_used = list(backend_latencies.keys())
         self.stats_monitor.on_store_finished(
-            monitor_req_id, tot_token_num, backends=backends_used
+            monitor_req_id,
+            tot_token_num,
+            backends=backends_used,
+            backend_latencies=backend_latencies,
         )
 
     @_lmcache_nvtx_annotate
@@ -377,7 +382,8 @@ class LMCacheEngine:
 
             keys_multi_layer = key.split_layers(self.num_layers)
             # Only check the first layer
-            if self.storage_manager.contains(keys_multi_layer[0]):
+            backend = self.storage_manager.contains(keys_multi_layer[0])
+            if backend:
                 continue
 
             # Allocate the memory object
@@ -425,23 +431,44 @@ class LMCacheEngine:
 
             next(mem_obj_generator)
 
-            backends_used_set = set()
+            all_backend_latencies: Dict[str, List[float]] = {}
             for layer_id in range(self.num_layers):
                 yield
                 next(mem_obj_generator)
-                backends_used = self.storage_manager.batched_put(
+                backend_latencies = self.storage_manager.batched_put(
                     keys[layer_id], memory_objs[layer_id]
                 )
-                backends_used_set.update(backends_used)
+                # Accumulate latencies across layers
+                for backend, latency in backend_latencies.items():
+                    if backend not in all_backend_latencies:
+                        all_backend_latencies[backend] = []
+                    all_backend_latencies[backend].append(latency)
         else:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`
-            backends_used_set = set()
+            all_backend_latencies = {}
             for layer_id in range(self.num_layers):
                 yield
 
+        # Average latency across all layers for each backend
+        avg_backend_latencies = (
+            {
+                backend: sum(latencies) / len(latencies)
+                for backend, latencies in all_backend_latencies.items()
+            }
+            if all_backend_latencies
+            else {}
+        )
+
+        # Derive backends from latencies keys
+        backends_used = (
+            list(avg_backend_latencies.keys()) if avg_backend_latencies else []
+        )
         self.stats_monitor.on_store_finished(
-            monitor_req_id, tot_token_num, backends=list(backends_used_set)
+            monitor_req_id,
+            tot_token_num,
+            backends=backends_used,
+            backend_latencies=avg_backend_latencies,
         )
         logger.debug(f"Stored {tot_token_num} out of total {len(tokens)} tokens")
         yield
@@ -488,6 +515,7 @@ class LMCacheEngine:
 
         reordered_chunks: List[Tuple[CacheEngineKey, MemoryObj, int, int]] = []
         backend_tokens: dict[str, int] = {}
+        backend_latencies: dict[str, float] = {}
         if not self._is_passive():
             if self.async_loading:
                 reordered_chunks, tot_kv_size = self._async_process_tokens_internal(  # noqa: E501
@@ -497,7 +525,7 @@ class LMCacheEngine:
                     **kwargs,
                 )
             else:
-                reordered_chunks, tot_kv_size, backend_tokens = (
+                reordered_chunks, tot_kv_size, backend_tokens, backend_latencies = (
                     self._process_tokens_internal(
                         tokens,
                         mask,
@@ -532,7 +560,10 @@ class LMCacheEngine:
         retrieved_tokens = torch.sum(ret_mask)
         # Report retrieve metrics (aggregate + per-backend)
         self.stats_monitor.on_retrieve_finished(
-            monitor_req_id, retrieved_tokens, backend_tokens=backend_tokens
+            monitor_req_id,
+            retrieved_tokens,
+            backend_tokens=backend_tokens,
+            backend_latencies=backend_latencies,
         )
         logger.info(
             "Retrieved %d out of total %d out of total %d tokens. size: %.4f gb,"
@@ -835,7 +866,7 @@ class LMCacheEngine:
 
         keys = self.lookup_pins[event_id]
 
-        memory_objs = self.storage_manager.batched_get(
+        memory_objs, _ = self.storage_manager.batched_get(
             keys=keys,
             location=old_position,
         )
@@ -945,7 +976,7 @@ class LMCacheEngine:
 
         keys = self.lookup_pins[event_id]
 
-        memory_objs = self.storage_manager.batched_get(
+        memory_objs, _ = self.storage_manager.batched_get(
             keys=keys,
             location=location,
         )
@@ -1000,7 +1031,7 @@ class LMCacheEngine:
 
         keys = self.lookup_pins[event_id]
 
-        compressed_memory_objs = self.storage_manager.batched_get(
+        compressed_memory_objs, _ = self.storage_manager.batched_get(
             keys=keys,
             location=location,
         )
@@ -1155,7 +1186,12 @@ class LMCacheEngine:
         mask,
         ret_mask,
         **kwargs,
-    ) -> tuple[list[tuple[CacheEngineKey, MemoryObj, int, int]], int, dict[str, int]]:
+    ) -> tuple[
+        list[tuple[CacheEngineKey, MemoryObj, int, int]],
+        int,
+        dict[str, int],
+        dict[str, float],
+    ]:
         """Process tokens and populate the reordered lists.
 
         This function is used to process tokens and populate the reordered lists.
@@ -1224,12 +1260,20 @@ class LMCacheEngine:
 
         last_failed_block_start = None
         backend_tokens: dict[str, int] = {}
+        get_latencies: Dict[str, List[float]] = {}
+
         for location, blocks in block_mapping.items():
             keys = [key for key, _, _ in blocks]
-            memory_objs = self.storage_manager.batched_get(
+            memory_objs, backend_get_latencies = self.storage_manager.batched_get(
                 keys=keys,
                 location=location,
             )
+            # Accumulate get latencies
+            for backend, latency in backend_get_latencies.items():
+                if backend not in get_latencies:
+                    get_latencies[backend] = []
+                get_latencies[backend].append(latency)
+
             assert memory_objs is not None, (
                 "Failed to get memory objects from storage backend"
             )
@@ -1259,7 +1303,13 @@ class LMCacheEngine:
                 for key, memory_obj, start, end in reordered_chunks
                 if end < last_failed_block_start
             ]
-        return reordered_chunks, tot_kv_size, backend_tokens
+
+        # Average get latencies per backend
+        avg_latencies = {}
+        for backend, latencies in get_latencies.items():
+            avg_latencies[backend] = sum(latencies) / len(latencies) if latencies else 0
+
+        return reordered_chunks, tot_kv_size, backend_tokens, avg_latencies
 
     def _broadcast_or_receive_memory_objs(
         self,

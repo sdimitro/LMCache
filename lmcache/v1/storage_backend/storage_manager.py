@@ -2,10 +2,11 @@
 # Standard
 from collections import OrderedDict
 from concurrent.futures import Future
-from typing import TYPE_CHECKING, Generator, List, Optional, Sequence
+from typing import TYPE_CHECKING, Dict, Generator, List, Optional, Sequence
 import asyncio
 import functools
 import threading
+import time
 
 # Third Party
 import torch
@@ -225,14 +226,14 @@ class StorageManager:
         memory_objs: List[MemoryObj],
         transfer_spec=None,  # TODO(Jiayi): add type check
         location: Optional[str] = None,
-    ) -> List[str]:
+    ) -> Dict[str, float]:
         """
         Non-blocking function to batched put the memory objects into the
         storage backends.
         Do not store if the same object is being stored (handled here by
         storage manager) or has been stored (handled by storage backend).
 
-        :return: List of backend names that were targeted for storage
+        :return: Dict mapping backend names to latency in milliseconds
         """
 
         if self.enable_nixl or (location and location == "NixlBackend"):
@@ -271,7 +272,7 @@ class StorageManager:
                 memory_objs = cpu_memory_objs
                 keys = cpu_keys
 
-        backends_used = []
+        latencies = {}
         for backend_name, backend in self.storage_backends.items():
             if backend_name == "NixlBackend":
                 continue
@@ -279,8 +280,10 @@ class StorageManager:
                 continue
             # NOTE: the handling of exists_in_put_tasks
             # is done in the backend
+            start_time = time.perf_counter()
             backend.batched_submit_put_task(keys, memory_objs)
-            backends_used.append(backend_name)
+            end_time = time.perf_counter()
+            latencies[backend_name] = (end_time - start_time) * 1000  # Convert to ms
 
         if self.lookup_server is not None:
             self.lookup_server.batched_insert(keys)
@@ -288,7 +291,7 @@ class StorageManager:
         for memory_obj in memory_objs:
             memory_obj.ref_count_down()
 
-        return backends_used
+        return latencies
 
     def get(
         self,
@@ -319,18 +322,25 @@ class StorageManager:
         self,
         keys: List[CacheEngineKey],
         location: Optional[str] = None,
-    ) -> Optional[List[Optional[MemoryObj]]]:
+    ) -> tuple[Optional[List[Optional[MemoryObj]]], Dict[str, float]]:
         """
         Blocking function to get the memory objects from the storages.
+
+        :return: Tuple of (memory_objs if found else None, dict of
+        latencies per backend in ms)
         """
         # TODO (ApostaC): remove the nested optional here
+        latencies = {}
         for backend_name, storage_backend in self.storage_backends.items():
             if location and backend_name != location:
                 continue
+            start_time = time.perf_counter()
             memory_objs = storage_backend.batched_get_blocking(keys)
+            end_time = time.perf_counter()
+            latencies[backend_name] = (end_time - start_time) * 1000  # Convert to ms
             if memory_objs:
-                return memory_objs
-        return None
+                return memory_objs, latencies
+        return None, latencies
 
     def layerwise_batched_get(
         self,
@@ -486,9 +496,8 @@ class StorageManager:
 
         :param bool pin: Whether to pin the key.
 
-        return: True if the key exists in the specified storage backends.
+        return: Backend name if found, else None
         """
-
         for backend_name, backend in self.storage_backends.items():
             if search_range and backend_name not in search_range:
                 continue

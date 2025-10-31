@@ -38,6 +38,10 @@ class LMCacheStats:
     backend_retrieve_retrieved_tokens: Dict[str, int]
     backend_store_stored_tokens: Dict[str, int]
 
+    # Per-backend latency measurements (in milliseconds)
+    backend_get_latencies: Dict[str, List[float]]
+    backend_put_latencies: Dict[str, List[float]]
+
     interval_remote_read_requests: int
     interval_remote_read_bytes: int
     interval_remote_write_requests: int
@@ -138,6 +142,10 @@ class LMCStatsMonitor:
         self.backend_retrieve_retrieved_tokens: Dict[str, int] = {}
         self.backend_store_stored_tokens: Dict[str, int] = {}
 
+        # Per-backend latency measurements (backend_name -> list of latencies in ms)
+        self.backend_get_latencies: Dict[str, List[float]] = {}
+        self.backend_put_latencies: Dict[str, List[float]] = {}
+
         # remote backends read/write metrics
         self.interval_remote_read_requests = 0
         self.interval_remote_read_bytes = 0
@@ -184,7 +192,9 @@ class LMCStatsMonitor:
 
     @thread_safe
     def on_lookup_finished(
-        self, num_hit_tokens: int, backend_hits: Optional[Dict[str, int]] = None
+        self,
+        num_hit_tokens: int,
+        backend_hits: Optional[Dict[str, int]] = None,
     ):
         """
         This function is called when a lookup request is finished.
@@ -230,6 +240,7 @@ class LMCStatsMonitor:
         request_id: int,
         retrieved_tokens: int,
         backend_tokens: Optional[Dict[str, int]] = None,
+        backend_latencies: Optional[Dict[str, float]] = None,
     ):
         """
         This function is called when a retrieve request is finished.
@@ -241,6 +252,10 @@ class LMCStatsMonitor:
         :param Optional[Dict[str, int]] backend_tokens:
         Dictionary mapping backend names to number of tokens retrieved
         from each backend in this retrieve request.
+
+        :param Optional[Dict[str, float]] backend_latencies:
+        Dictionary mapping backend names to latency in milliseconds
+        for get operations in this retrieve request.
         """
         curr_time = time.time()
         assert request_id in self.retrieve_requests
@@ -253,6 +268,13 @@ class LMCStatsMonitor:
                 self.backend_retrieve_retrieved_tokens[backend] = (
                     self.backend_retrieve_retrieved_tokens.get(backend, 0) + count
                 )
+
+        # Update per-backend latencies if provided
+        if backend_latencies:
+            for backend, latency in backend_latencies.items():
+                if backend not in self.backend_get_latencies:
+                    self.backend_get_latencies[backend] = []
+                self.backend_get_latencies[backend].append(latency)
 
     @thread_safe
     def on_store_request(self, num_tokens: int) -> int:
@@ -275,6 +297,7 @@ class LMCStatsMonitor:
         request_id: int,
         num_tokens: int = -1,
         backends: Optional[List[str]] = None,
+        backend_latencies: Optional[Dict[str, float]] = None,
     ):
         """
         This function is called when a store request is finished.
@@ -285,6 +308,9 @@ class LMCStatsMonitor:
         :param Optional[List[str]] backends:
         List of backend names where tokens were stored in this store request.
             If provided, updates per-backend counters for each backend.
+        :param Optional[Dict[str, float]] backend_latencies:
+        Dictionary mapping backend names to latency in milliseconds
+        for put operations in this store request.
         """
         curr_time = time.time()
         assert request_id in self.store_requests
@@ -299,6 +325,13 @@ class LMCStatsMonitor:
                 self.backend_store_stored_tokens[backend] = (
                     self.backend_store_stored_tokens.get(backend, 0) + stored_tokens
                 )
+
+        # Update per-backend latencies if provided
+        if backend_latencies:
+            for backend, latency in backend_latencies.items():
+                if backend not in self.backend_put_latencies:
+                    self.backend_put_latencies[backend] = []
+                self.backend_put_latencies[backend].append(latency)
 
     @thread_safe
     def update_local_cache_usage(self, usage: int):
@@ -389,6 +422,10 @@ class LMCStatsMonitor:
         self.backend_retrieve_retrieved_tokens.clear()
         self.backend_store_stored_tokens.clear()
 
+        # Clear per-backend latencies
+        self.backend_get_latencies.clear()
+        self.backend_put_latencies.clear()
+
         self.interval_remote_read_requests = 0
         self.interval_remote_read_bytes = 0
         self.interval_remote_write_requests = 0
@@ -472,6 +509,12 @@ class LMCStatsMonitor:
             backend_lookup_hit_tokens=self.backend_lookup_hit_tokens.copy(),
             backend_retrieve_retrieved_tokens=self.backend_retrieve_retrieved_tokens.copy(),
             backend_store_stored_tokens=self.backend_store_stored_tokens.copy(),
+            backend_get_latencies={
+                k: v.copy() for k, v in self.backend_get_latencies.items()
+            },
+            backend_put_latencies={
+                k: v.copy() for k, v in self.backend_put_latencies.items()
+            },
             interval_remote_read_requests=self.interval_remote_read_requests,
             interval_remote_read_bytes=self.interval_remote_read_bytes,
             interval_remote_write_requests=self.interval_remote_write_requests,
@@ -913,6 +956,46 @@ class PrometheusLogger:
             labelnames=labelnames,
             multiprocess_mode="livemostrecent",
         )
+
+        # Per-backend latency histograms
+        labelnames_with_backend = labelnames + ["backend"]
+
+        # Use millisecond buckets that cover all backend types (fast to slow)
+        backend_latency_buckets = [
+            0.01,
+            0.05,
+            0.1,
+            0.5,
+            1,
+            2,
+            5,
+            10,
+            25,
+            50,
+            100,
+            250,
+            500,
+            1000,
+            2500,
+            5000,
+            10000,
+        ]
+
+        self.histogram_backend_get_latency = self._histogram_cls(
+            name="lmcache:backend_get_latency_ms",
+            documentation="Latency of get/retrieve operations "
+            "per backend (milliseconds)",
+            labelnames=labelnames_with_backend,
+            buckets=backend_latency_buckets,
+        )
+
+        self.histogram_backend_put_latency = self._histogram_cls(
+            name="lmcache:backend_put_latency_ms",
+            documentation="Latency of put/store operations per backend (milliseconds)",
+            labelnames=labelnames_with_backend,
+            buckets=backend_latency_buckets,
+        )
+
         self._dynamic_metrics(labelnames)
 
     def _dynamic_metrics(self, labelnames):
@@ -1080,6 +1163,23 @@ class PrometheusLogger:
         self._log_gauge(
             self.gauge_pinned_memory_objs_count, stats.pinned_memory_objs_count
         )
+
+        # Log per-backend latency histograms
+        for backend, latencies in stats.backend_get_latencies.items():
+            if latencies:
+                labels_with_backend = {**self.labels, "backend": backend}
+                for latency in latencies:
+                    self.histogram_backend_get_latency.labels(
+                        **labels_with_backend
+                    ).observe(latency)
+
+        for backend, latencies in stats.backend_put_latencies.items():
+            if latencies:
+                labels_with_backend = {**self.labels, "backend": backend}
+                for latency in latencies:
+                    self.histogram_backend_put_latency.labels(
+                        **labels_with_backend
+                    ).observe(latency)
 
     @staticmethod
     def _metadata_to_labels(metadata: LMCacheEngineMetadata):

@@ -106,6 +106,15 @@ LMCache exposes a variety of metrics to monitor its performance. The following t
    * - ``lmcache:num_store_stored_tokens_by_backend``
      - Counter
      - Total number of tokens stored by backend (labeled by backend name)
+   * - **Per-Backend Latency Metrics**
+     - 
+     - 
+   * - ``lmcache:backend_get_latency_ms``
+     - Histogram
+     - Latency of get/retrieve operations per backend in milliseconds (labeled by backend name)
+   * - ``lmcache:backend_put_latency_ms``
+     - Histogram
+     - Latency of put/store operations per backend in milliseconds (labeled by backend name)
    * - **Hit Rate Metrics**
      - 
      - 
@@ -250,6 +259,22 @@ The per-backend metrics allow you to break down performance by storage backend. 
 
    # Which backend serves most lookups?
    topk(3, sum by (backend) (rate(lmcache:num_lookup_hit_tokens_by_backend[5m])))
+
+**Backend latency analysis:**
+
+.. code-block:: promql
+
+   # p50 latency for each backend's get operations
+   histogram_quantile(0.50, sum by (backend, le) (rate(lmcache:backend_get_latency_ms_bucket[5m])))
+   
+   # p95 latency for each backend's get operations
+   histogram_quantile(0.95, sum by (backend, le) (rate(lmcache:backend_get_latency_ms_bucket[5m])))
+   
+   # p99 latency for WekaGdsBackend specifically
+   histogram_quantile(0.99, rate(lmcache:backend_get_latency_ms_bucket{backend="WekaGdsBackend"}[5m]))
+   
+   # Identify slowest backend for store operations
+   topk(1, histogram_quantile(0.99, sum by (backend, le) (rate(lmcache:backend_put_latency_ms_bucket[5m]))))
 
 **Aggregate metrics (without backend label) are still available:**
 
