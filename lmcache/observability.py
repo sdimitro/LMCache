@@ -25,10 +25,12 @@ class LMCacheStats:
     interval_retrieve_requests: int
     interval_store_requests: int
     interval_lookup_requests: int
-    interval_requested_tokens: int
-    interval_hit_tokens: int
-    interval_lookup_tokens: int
-    interval_lookup_hits: int
+    interval_retrieve_requested_tokens: int
+    interval_retrieve_retrieved_tokens: int
+    interval_store_requested_tokens: int
+    interval_store_stored_tokens: int
+    interval_lookup_requested_tokens: int
+    interval_lookup_hit_tokens: int
     interval_vllm_hit_tokens: int
 
     interval_remote_read_requests: int
@@ -118,10 +120,12 @@ class LMCStatsMonitor:
         self.interval_retrieve_requests = 0
         self.interval_store_requests = 0
         self.interval_lookup_requests = 0
-        self.interval_requested_tokens = 0  # total requested tokens retrieve
-        self.interval_hit_tokens = 0  # total hit tokens retrieve
-        self.interval_lookup_tokens = 0  # total requested tokens lookup
-        self.interval_lookup_hits = 0  # total hit tokens lookup
+        self.interval_retrieve_requested_tokens = 0  # total requested tokens retrieve
+        self.interval_retrieve_retrieved_tokens = 0  # total retrieved tokens retrieve
+        self.interval_store_requested_tokens = 0  # total requested tokens store
+        self.interval_store_stored_tokens = 0  # total stored tokens store
+        self.interval_lookup_requested_tokens = 0  # total requested tokens lookup
+        self.interval_lookup_hit_tokens = 0  # total hit tokens lookup
         self.interval_vllm_hit_tokens = 0  # total hit tokens in vllm
 
         # remote backends read/write metrics
@@ -166,7 +170,7 @@ class LMCStatsMonitor:
         It will record the number of tokens requested.
         """
         self.interval_lookup_requests += 1
-        self.interval_lookup_tokens += num_tokens
+        self.interval_lookup_requested_tokens += num_tokens
 
     @thread_safe
     def on_lookup_finished(self, num_hit_tokens: int):
@@ -174,7 +178,7 @@ class LMCStatsMonitor:
         This function is called when a lookup request is finished.
         It will record the number of tokens hit.
         """
-        self.interval_lookup_hits += num_hit_tokens
+        self.interval_lookup_hit_tokens += num_hit_tokens
 
     @thread_safe
     def on_retrieve_request(self, num_tokens: int) -> int:
@@ -190,7 +194,7 @@ class LMCStatsMonitor:
             start_time=curr_time,
             end_time=0,
         )
-        self.interval_requested_tokens += num_tokens
+        self.interval_retrieve_requested_tokens += num_tokens
         self.interval_retrieve_requests += 1
         self.retrieve_requests[self.retrieve_request_id] = retrieve_stats
         self.retrieve_request_id += 1
@@ -203,7 +207,7 @@ class LMCStatsMonitor:
         retrieve_stats = self.retrieve_requests[request_id]
         retrieve_stats.local_hit_tokens = retrieved_tokens
         retrieve_stats.end_time = curr_time
-        self.interval_hit_tokens += retrieved_tokens
+        self.interval_retrieve_retrieved_tokens += retrieved_tokens
 
     @thread_safe
     def on_store_request(self, num_tokens: int) -> int:
@@ -215,6 +219,7 @@ class LMCStatsMonitor:
             num_tokens=num_tokens, start_time=curr_time, end_time=0
         )
         self.interval_store_requests += 1
+        self.interval_store_requested_tokens += num_tokens
         self.store_requests[self.store_request_id] = store_stats
         self.store_request_id += 1
         return self.store_request_id - 1
@@ -227,6 +232,10 @@ class LMCStatsMonitor:
         store_stats.end_time = curr_time
         if num_tokens >= 0:
             store_stats.num_tokens = num_tokens
+            self.interval_store_stored_tokens += num_tokens
+        else:
+            # If num_tokens not provided, use the original requested tokens
+            self.interval_store_stored_tokens += store_stats.num_tokens
 
     @thread_safe
     def update_local_cache_usage(self, usage: int):
@@ -304,10 +313,12 @@ class LMCStatsMonitor:
         self.interval_store_requests = 0
         self.interval_lookup_requests = 0
 
-        self.interval_requested_tokens = 0
-        self.interval_hit_tokens = 0
-        self.interval_lookup_tokens = 0
-        self.interval_lookup_hits = 0
+        self.interval_retrieve_requested_tokens = 0
+        self.interval_retrieve_retrieved_tokens = 0
+        self.interval_store_requested_tokens = 0
+        self.interval_store_stored_tokens = 0
+        self.interval_lookup_requested_tokens = 0
+        self.interval_lookup_hit_tokens = 0
         self.interval_vllm_hit_tokens = 0
 
         self.interval_remote_read_requests = 0
@@ -350,14 +361,15 @@ class LMCStatsMonitor:
         """
         retrieve_hit_rate = (
             0
-            if self.interval_requested_tokens == 0
-            else self.interval_hit_tokens / self.interval_requested_tokens
+            if self.interval_retrieve_requested_tokens == 0
+            else self.interval_retrieve_retrieved_tokens
+            / self.interval_retrieve_requested_tokens
         )
 
         lookup_hit_rate = (
             0
-            if self.interval_lookup_tokens == 0
-            else self.interval_lookup_hits / self.interval_lookup_tokens
+            if self.interval_lookup_requested_tokens == 0
+            else self.interval_lookup_hit_tokens / self.interval_lookup_requested_tokens
         )
 
         def filter_out_invalid(stats: List[float]):
@@ -383,10 +395,12 @@ class LMCStatsMonitor:
             interval_retrieve_requests=self.interval_retrieve_requests,
             interval_store_requests=self.interval_store_requests,
             interval_lookup_requests=self.interval_lookup_requests,
-            interval_requested_tokens=self.interval_requested_tokens,
-            interval_hit_tokens=self.interval_hit_tokens,
-            interval_lookup_tokens=self.interval_lookup_tokens,
-            interval_lookup_hits=self.interval_lookup_hits,
+            interval_retrieve_requested_tokens=self.interval_retrieve_requested_tokens,
+            interval_retrieve_retrieved_tokens=self.interval_retrieve_retrieved_tokens,
+            interval_store_requested_tokens=self.interval_store_requested_tokens,
+            interval_store_stored_tokens=self.interval_store_stored_tokens,
+            interval_lookup_requested_tokens=self.interval_lookup_requested_tokens,
+            interval_lookup_hit_tokens=self.interval_lookup_hit_tokens,
             interval_remote_read_requests=self.interval_remote_read_requests,
             interval_remote_read_bytes=self.interval_remote_read_bytes,
             interval_remote_write_requests=self.interval_remote_write_requests,
@@ -475,26 +489,38 @@ class PrometheusLogger:
             labelnames=labelnames,
         )
 
-        self.counter_num_requested_tokens = self._counter_cls(
-            name="lmcache:num_requested_tokens",
-            documentation="Total number of tokens requested from lmcache",
+        self.counter_num_retrieve_requested_tokens = self._counter_cls(
+            name="lmcache:num_retrieve_requested_tokens",
+            documentation="Total number of tokens requested in retrieve from lmcache",
             labelnames=labelnames,
         )
 
-        self.counter_num_hit_tokens = self._counter_cls(
-            name="lmcache:num_hit_tokens",
-            documentation="Total number of tokens hit in lmcache",
+        self.counter_num_retrieve_retrieved_tokens = self._counter_cls(
+            name="lmcache:num_retrieve_retrieved_tokens",
+            documentation="Total number of tokens retrieved from lmcache",
             labelnames=labelnames,
         )
 
-        self.counter_num_lookup_tokens = self._counter_cls(
-            name="lmcache:num_lookup_tokens",
+        self.counter_num_store_requested_tokens = self._counter_cls(
+            name="lmcache:num_store_requested_tokens",
+            documentation="Total number of tokens requested to store in lmcache",
+            labelnames=labelnames,
+        )
+
+        self.counter_num_store_stored_tokens = self._counter_cls(
+            name="lmcache:num_store_stored_tokens",
+            documentation="Total number of tokens actually stored in lmcache",
+            labelnames=labelnames,
+        )
+
+        self.counter_num_lookup_requested_tokens = self._counter_cls(
+            name="lmcache:num_lookup_requested_tokens",
             documentation="Total number of tokens requested in lookup from lmcache",
             labelnames=labelnames,
         )
 
-        self.counter_num_lookup_hits = self._counter_cls(
-            name="lmcache:num_lookup_hits",
+        self.counter_num_lookup_hit_tokens = self._counter_cls(
+            name="lmcache:num_lookup_hit_tokens",
             documentation="Total number of tokens hit in lookup from lmcache",
             labelnames=labelnames,
         )
@@ -841,11 +867,27 @@ class PrometheusLogger:
         )
 
         self._log_counter(
-            self.counter_num_requested_tokens, stats.interval_requested_tokens
+            self.counter_num_retrieve_requested_tokens,
+            stats.interval_retrieve_requested_tokens,
         )
-        self._log_counter(self.counter_num_hit_tokens, stats.interval_hit_tokens)
-        self._log_counter(self.counter_num_lookup_tokens, stats.interval_lookup_tokens)
-        self._log_counter(self.counter_num_lookup_hits, stats.interval_lookup_hits)
+        self._log_counter(
+            self.counter_num_retrieve_retrieved_tokens,
+            stats.interval_retrieve_retrieved_tokens,
+        )
+        self._log_counter(
+            self.counter_num_store_requested_tokens,
+            stats.interval_store_requested_tokens,
+        )
+        self._log_counter(
+            self.counter_num_store_stored_tokens, stats.interval_store_stored_tokens
+        )
+        self._log_counter(
+            self.counter_num_lookup_requested_tokens,
+            stats.interval_lookup_requested_tokens,
+        )
+        self._log_counter(
+            self.counter_num_lookup_hit_tokens, stats.interval_lookup_hit_tokens
+        )
         self._log_counter(
             self.counter_num_vllm_hit_tokens, stats.interval_vllm_hit_tokens
         )

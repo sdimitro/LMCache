@@ -73,16 +73,22 @@ LMCache exposes a variety of metrics to monitor its performance. The following t
    * - ``lmcache:num_lookup_requests``
      - Counter
      - Total number of lookup requests
-   * - ``lmcache:num_requested_tokens``
+   * - ``lmcache:num_retrieve_requested_tokens``
      - Counter
-     - Total number of tokens requested for retrieval
-   * - ``lmcache:num_hit_tokens``
+     - Total number of tokens requested in retrieve operations
+   * - ``lmcache:num_retrieve_retrieved_tokens``
      - Counter
-     - Total number of cache hit tokens from retrieval
-   * - ``lmcache:num_lookup_tokens``
+     - Total number of tokens successfully retrieved
+   * - ``lmcache:num_store_requested_tokens``
+     - Counter
+     - Total number of tokens requested to store
+   * - ``lmcache:num_store_stored_tokens``
+     - Counter
+     - Total number of tokens actually stored
+   * - ``lmcache:num_lookup_requested_tokens``
      - Counter
      - Total number of tokens requested in lookup operations
-   * - ``lmcache:num_lookup_hits``
+   * - ``lmcache:num_lookup_hit_tokens``
      - Counter
      - Total number of tokens hit in lookup operations
    * - ``lmcache:num_vllm_hit_tokens``

@@ -39,6 +39,19 @@ def test_on_store_request_and_finished(stats_monitor):
     stats_monitor.on_store_finished(request_id=request_id)
     stats = stats_monitor.get_stats_and_clear()
     assert stats.interval_store_requests == 1
+    assert stats.interval_store_requested_tokens == 50
+    assert stats.interval_store_stored_tokens == 50
+    assert len(stats.time_to_store) == 1
+
+
+def test_on_store_request_partial_store(stats_monitor):
+    # Test case where fewer tokens are stored than requested
+    request_id = stats_monitor.on_store_request(num_tokens=100)
+    stats_monitor.on_store_finished(request_id=request_id, num_tokens=60)
+    stats = stats_monitor.get_stats_and_clear()
+    assert stats.interval_store_requests == 1
+    assert stats.interval_store_requested_tokens == 100
+    assert stats.interval_store_stored_tokens == 60
     assert len(stats.time_to_store) == 1
 
 
@@ -64,7 +77,7 @@ def test_on_lookup_request(stats_monitor):
     stats_monitor.on_lookup_request(num_tokens=50)
     stats = stats_monitor.get_stats_and_clear()
     assert stats.interval_lookup_requests == 1
-    assert stats.interval_lookup_tokens == 50
+    assert stats.interval_lookup_requested_tokens == 50
     assert stats.lookup_hit_rate == 0
 
 
@@ -73,8 +86,8 @@ def test_on_lookup_finished(stats_monitor):
     stats_monitor.on_lookup_finished(num_hit_tokens=80)
     stats = stats_monitor.get_stats_and_clear()
     assert stats.interval_lookup_requests == 1
-    assert stats.interval_lookup_tokens == 100
-    assert stats.interval_lookup_hits == 80
+    assert stats.interval_lookup_requested_tokens == 100
+    assert stats.interval_lookup_hit_tokens == 80
     assert stats.lookup_hit_rate == 0.8
 
 
@@ -150,8 +163,8 @@ def test_multiple_lookup_operations(stats_monitor):
 
     stats = stats_monitor.get_stats_and_clear()
     assert stats.interval_lookup_requests == 2
-    assert stats.interval_lookup_tokens == 300
-    assert stats.interval_lookup_hits == 230
+    assert stats.interval_lookup_requested_tokens == 300
+    assert stats.interval_lookup_hit_tokens == 230
     assert stats.lookup_hit_rate == 230 / 300
 
 
