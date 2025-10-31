@@ -33,6 +33,11 @@ class LMCacheStats:
     interval_lookup_hit_tokens: int
     interval_vllm_hit_tokens: int
 
+    # Per-backend metrics
+    backend_lookup_hit_tokens: Dict[str, int]
+    backend_retrieve_retrieved_tokens: Dict[str, int]
+    backend_store_stored_tokens: Dict[str, int]
+
     interval_remote_read_requests: int
     interval_remote_read_bytes: int
     interval_remote_write_requests: int
@@ -128,6 +133,11 @@ class LMCStatsMonitor:
         self.interval_lookup_hit_tokens = 0  # total hit tokens lookup
         self.interval_vllm_hit_tokens = 0  # total hit tokens in vllm
 
+        # Per-backend metrics (backend_name -> count)
+        self.backend_lookup_hit_tokens: Dict[str, int] = {}
+        self.backend_retrieve_retrieved_tokens: Dict[str, int] = {}
+        self.backend_store_stored_tokens: Dict[str, int] = {}
+
         # remote backends read/write metrics
         self.interval_remote_read_requests = 0
         self.interval_remote_read_bytes = 0
@@ -173,12 +183,26 @@ class LMCStatsMonitor:
         self.interval_lookup_requested_tokens += num_tokens
 
     @thread_safe
-    def on_lookup_finished(self, num_hit_tokens: int):
+    def on_lookup_finished(
+        self, num_hit_tokens: int, backend_hits: Optional[Dict[str, int]] = None
+    ):
         """
         This function is called when a lookup request is finished.
         It will record the number of tokens hit.
+
+        :param int num_hit_tokens: The total number of tokens that
+        were hit (aggregate) in this lookup request
+
+        :param Optional[Dict[str, int]] backend_hits:
+        Dictionary mapping backend names to number of tokens hit
+        in each backend in this lookup request.
         """
         self.interval_lookup_hit_tokens += num_hit_tokens
+        if backend_hits:
+            for backend, count in backend_hits.items():
+                self.backend_lookup_hit_tokens[backend] = (
+                    self.backend_lookup_hit_tokens.get(backend, 0) + count
+                )
 
     @thread_safe
     def on_retrieve_request(self, num_tokens: int) -> int:
@@ -201,13 +225,34 @@ class LMCStatsMonitor:
         return self.retrieve_request_id - 1
 
     @thread_safe
-    def on_retrieve_finished(self, request_id: int, retrieved_tokens: int):
+    def on_retrieve_finished(
+        self,
+        request_id: int,
+        retrieved_tokens: int,
+        backend_tokens: Optional[Dict[str, int]] = None,
+    ):
+        """
+        This function is called when a retrieve request is finished.
+
+        :param int request_id: The request ID from on_retrieve_request
+        :param int retrieved_tokens: The total number of tokens that were retrieved
+            (aggregate) in this retrieve request
+
+        :param Optional[Dict[str, int]] backend_tokens:
+        Dictionary mapping backend names to number of tokens retrieved
+        from each backend in this retrieve request.
+        """
         curr_time = time.time()
         assert request_id in self.retrieve_requests
         retrieve_stats = self.retrieve_requests[request_id]
         retrieve_stats.local_hit_tokens = retrieved_tokens
         retrieve_stats.end_time = curr_time
         self.interval_retrieve_retrieved_tokens += retrieved_tokens
+        if backend_tokens:
+            for backend, count in backend_tokens.items():
+                self.backend_retrieve_retrieved_tokens[backend] = (
+                    self.backend_retrieve_retrieved_tokens.get(backend, 0) + count
+                )
 
     @thread_safe
     def on_store_request(self, num_tokens: int) -> int:
@@ -225,17 +270,35 @@ class LMCStatsMonitor:
         return self.store_request_id - 1
 
     @thread_safe
-    def on_store_finished(self, request_id: int, num_tokens: int = -1):
+    def on_store_finished(
+        self,
+        request_id: int,
+        num_tokens: int = -1,
+        backends: Optional[List[str]] = None,
+    ):
+        """
+        This function is called when a store request is finished.
+
+        :param int request_id: The request ID from on_store_request
+        :param int num_tokens: The number of tokens that were actually stored.
+            If -1, uses the original requested tokens count.
+        :param Optional[List[str]] backends:
+        List of backend names where tokens were stored in this store request.
+            If provided, updates per-backend counters for each backend.
+        """
         curr_time = time.time()
         assert request_id in self.store_requests
         store_stats = self.store_requests[request_id]
         store_stats.end_time = curr_time
+        stored_tokens = num_tokens if num_tokens >= 0 else store_stats.num_tokens
         if num_tokens >= 0:
             store_stats.num_tokens = num_tokens
-            self.interval_store_stored_tokens += num_tokens
-        else:
-            # If num_tokens not provided, use the original requested tokens
-            self.interval_store_stored_tokens += store_stats.num_tokens
+        self.interval_store_stored_tokens += stored_tokens
+        if backends:
+            for backend in backends:
+                self.backend_store_stored_tokens[backend] = (
+                    self.backend_store_stored_tokens.get(backend, 0) + stored_tokens
+                )
 
     @thread_safe
     def update_local_cache_usage(self, usage: int):
@@ -321,6 +384,11 @@ class LMCStatsMonitor:
         self.interval_lookup_hit_tokens = 0
         self.interval_vllm_hit_tokens = 0
 
+        # Clear per-backend metrics
+        self.backend_lookup_hit_tokens.clear()
+        self.backend_retrieve_retrieved_tokens.clear()
+        self.backend_store_stored_tokens.clear()
+
         self.interval_remote_read_requests = 0
         self.interval_remote_read_bytes = 0
         self.interval_remote_write_requests = 0
@@ -401,6 +469,9 @@ class LMCStatsMonitor:
             interval_store_stored_tokens=self.interval_store_stored_tokens,
             interval_lookup_requested_tokens=self.interval_lookup_requested_tokens,
             interval_lookup_hit_tokens=self.interval_lookup_hit_tokens,
+            backend_lookup_hit_tokens=self.backend_lookup_hit_tokens.copy(),
+            backend_retrieve_retrieved_tokens=self.backend_retrieve_retrieved_tokens.copy(),
+            backend_store_stored_tokens=self.backend_store_stored_tokens.copy(),
             interval_remote_read_requests=self.interval_remote_read_requests,
             interval_remote_read_bytes=self.interval_remote_read_bytes,
             interval_remote_write_requests=self.interval_remote_write_requests,
@@ -529,6 +600,28 @@ class PrometheusLogger:
             name="lmcache:num_vllm_hit_tokens",
             documentation="Number of hit tokens in vllm",
             labelnames=labelnames,
+        )
+
+        # Per-backend metrics with backend label
+        labelnames_with_backend = labelnames + ["backend"]
+
+        self.counter_num_lookup_hit_tokens_by_backend = self._counter_cls(
+            name="lmcache:num_lookup_hit_tokens_by_backend",
+            documentation="Total number of tokens hit in lookup from lmcache "
+            "by backend in this lookup request",
+            labelnames=labelnames_with_backend,
+        )
+
+        self.counter_num_retrieve_retrieved_tokens_by_backend = self._counter_cls(
+            name="lmcache:num_retrieve_retrieved_tokens_by_backend",
+            documentation="Total number of tokens retrieved from lmcache by backend",
+            labelnames=labelnames_with_backend,
+        )
+
+        self.counter_num_store_stored_tokens_by_backend = self._counter_cls(
+            name="lmcache:num_store_stored_tokens_by_backend",
+            documentation="Total number of tokens stored in lmcache by backend",
+            labelnames=labelnames_with_backend,
         )
 
         self.counter_num_remote_read_requests = self._counter_cls(
@@ -891,6 +984,27 @@ class PrometheusLogger:
         self._log_counter(
             self.counter_num_vllm_hit_tokens, stats.interval_vllm_hit_tokens
         )
+
+        for backend, count in stats.backend_lookup_hit_tokens.items():
+            if count > 0:
+                labels_with_backend = {**self.labels, "backend": backend}
+                self.counter_num_lookup_hit_tokens_by_backend.labels(
+                    **labels_with_backend
+                ).inc(count)
+
+        for backend, count in stats.backend_retrieve_retrieved_tokens.items():
+            if count > 0:
+                labels_with_backend = {**self.labels, "backend": backend}
+                self.counter_num_retrieve_retrieved_tokens_by_backend.labels(
+                    **labels_with_backend
+                ).inc(count)
+
+        for backend, count in stats.backend_store_stored_tokens.items():
+            if count > 0:
+                labels_with_backend = {**self.labels, "backend": backend}
+                self.counter_num_store_stored_tokens_by_backend.labels(
+                    **labels_with_backend
+                ).inc(count)
 
         self._log_counter(
             self.counter_num_remote_read_requests,

@@ -94,6 +94,18 @@ LMCache exposes a variety of metrics to monitor its performance. The following t
    * - ``lmcache:num_vllm_hit_tokens``
      - Counter
      - Number of hit tokens in vLLM
+   * - **Per-Backend Token Metrics**
+     - 
+     - 
+   * - ``lmcache:num_lookup_hit_tokens_by_backend``
+     - Counter
+     - Total number of tokens hit in lookup by backend (labeled by backend name)
+   * - ``lmcache:num_retrieve_retrieved_tokens_by_backend``
+     - Counter
+     - Total number of tokens retrieved by backend (labeled by backend name)
+   * - ``lmcache:num_store_stored_tokens_by_backend``
+     - Counter
+     - Total number of tokens stored by backend (labeled by backend name)
    * - **Hit Rate Metrics**
      - 
      - 
@@ -196,5 +208,57 @@ LMCache exposes a variety of metrics to monitor its performance. The following t
    * - ``lmcache:pinned_memory_objs_count``
      - Gauge
      - The number of pinned memory objects
+
+
+Per-Backend Metrics Examples
+-----------------------------
+
+The per-backend metrics allow you to break down performance by storage backend. Here are some example Prometheus queries:
+
+**View lookup hits by backend:**
+
+.. code-block:: promql
+
+   # Total lookup hits per backend
+   lmcache:num_lookup_hit_tokens_by_backend{backend="LocalCPUBackend"}
+   lmcache:num_lookup_hit_tokens_by_backend{backend="WekaGdsBackend"}
+   lmcache:num_lookup_hit_tokens_by_backend{backend="LocalDiskBackend"}
+
+**View retrieve performance by backend:**
+
+.. code-block:: promql
+
+   # Rate of tokens retrieved per backend (tokens/sec)
+   rate(lmcache:num_retrieve_retrieved_tokens_by_backend[5m])
+   
+   # Compare backends
+   sum by (backend) (rate(lmcache:num_retrieve_retrieved_tokens_by_backend[5m]))
+
+**View store distribution across backends:**
+
+.. code-block:: promql
+
+   # Total tokens stored per backend
+   lmcache:num_store_stored_tokens_by_backend
+   
+   # Percentage of stores going to each backend
+   lmcache:num_store_stored_tokens_by_backend / ignoring(backend) group_left sum(lmcache:num_store_stored_tokens_by_backend)
+
+**Backend hit rate comparison:**
+
+.. code-block:: promql
+
+   # Which backend serves most lookups?
+   topk(3, sum by (backend) (rate(lmcache:num_lookup_hit_tokens_by_backend[5m])))
+
+**Aggregate metrics (without backend label) are still available:**
+
+.. code-block:: promql
+
+   # Total tokens retrieved across all backends
+   lmcache:num_retrieve_retrieved_tokens
+   
+   # Overall hit rate
+   lmcache:retrieve_hit_rate
 
 

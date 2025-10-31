@@ -302,7 +302,9 @@ class LMCacheEngine:
         t = time.perf_counter()
 
         transfer_spec = kwargs.get("transfer_spec", None)
-        self.storage_manager.batched_put(keys, memory_objs, transfer_spec=transfer_spec)
+        backends_used = self.storage_manager.batched_put(
+            keys, memory_objs, transfer_spec=transfer_spec
+        )
         put_time += time.perf_counter() - t
 
         tot_time = offload_time + put_time
@@ -319,7 +321,9 @@ class LMCacheEngine:
             put_time * 1000,
         )
 
-        self.stats_monitor.on_store_finished(monitor_req_id, tot_token_num)
+        self.stats_monitor.on_store_finished(
+            monitor_req_id, tot_token_num, backends=backends_used
+        )
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -421,17 +425,24 @@ class LMCacheEngine:
 
             next(mem_obj_generator)
 
+            backends_used_set = set()
             for layer_id in range(self.num_layers):
                 yield
                 next(mem_obj_generator)
-                self.storage_manager.batched_put(keys[layer_id], memory_objs[layer_id])
+                backends_used = self.storage_manager.batched_put(
+                    keys[layer_id], memory_objs[layer_id]
+                )
+                backends_used_set.update(backends_used)
         else:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`
+            backends_used_set = set()
             for layer_id in range(self.num_layers):
                 yield
 
-        self.stats_monitor.on_store_finished(monitor_req_id, tot_token_num)
+        self.stats_monitor.on_store_finished(
+            monitor_req_id, tot_token_num, backends=list(backends_used_set)
+        )
         logger.debug(f"Stored {tot_token_num} out of total {len(tokens)} tokens")
         yield
 
@@ -476,6 +487,7 @@ class LMCacheEngine:
         ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
 
         reordered_chunks: List[Tuple[CacheEngineKey, MemoryObj, int, int]] = []
+        backend_tokens: dict[str, int] = {}
         if not self._is_passive():
             if self.async_loading:
                 reordered_chunks, tot_kv_size = self._async_process_tokens_internal(  # noqa: E501
@@ -485,11 +497,13 @@ class LMCacheEngine:
                     **kwargs,
                 )
             else:
-                reordered_chunks, tot_kv_size = self._process_tokens_internal(
-                    tokens,
-                    mask,
-                    ret_mask,
-                    **kwargs,
+                reordered_chunks, tot_kv_size, backend_tokens = (
+                    self._process_tokens_internal(
+                        tokens,
+                        mask,
+                        ret_mask,
+                        **kwargs,
+                    )
                 )
         if self.save_only_first_rank:
             self._broadcast_or_receive_memory_objs(
@@ -516,7 +530,10 @@ class LMCacheEngine:
         onload_time = time.perf_counter() - t
 
         retrieved_tokens = torch.sum(ret_mask)
-        self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
+        # Report retrieve metrics (aggregate + per-backend)
+        self.stats_monitor.on_retrieve_finished(
+            monitor_req_id, retrieved_tokens, backend_tokens=backend_tokens
+        )
         logger.info(
             "Retrieved %d out of total %d out of total %d tokens. size: %.4f gb,"
             " cost %.4f ms, throughput: %.4f GB/s;",
@@ -706,6 +723,7 @@ class LMCacheEngine:
         try:
             end = 0
             prev_end = 0
+            backend_hits: dict[str, int] = {}
 
             if pin:
                 assert lookup_id is not None, "lookup_id is required when pin is True"
@@ -729,31 +747,43 @@ class LMCacheEngine:
                     key_all_layers = key.split_layers(self.num_layers)
 
                     found = False
+                    found_backend = None
                     for key_single_layer in key_all_layers:
-                        if self.storage_manager.contains(
+                        backend = self.storage_manager.contains(
                             key_single_layer, search_range, pin
-                        ):
+                        )
+                        if backend:
                             found = True
+                            found_backend = backend
                         if search_p2p:
                             assert self.lookup_server is not None
                             if self.lookup_server.lookup(key_single_layer):
                                 found = True
+                                found_backend = "p2p"
                     if found:
                         if pin:
                             self.lookup_pins[lookup_id].extend(  # type: ignore
                                 key_all_layers
                             )
                         prev_end = end
+                        if found_backend:
+                            backend_hits[found_backend] = backend_hits.get(
+                                found_backend, 0
+                            ) + (end - start)
                         continue
                     end = prev_end
                     return prev_end
                 else:
-                    if self.storage_manager.contains(key, search_range, pin):
+                    backend = self.storage_manager.contains(key, search_range, pin)
+                    if backend:
                         if pin:
                             self.lookup_pins[lookup_id].append(  # type: ignore
                                 key
                             )
                         prev_end = end
+                        backend_hits[backend] = backend_hits.get(backend, 0) + (
+                            end - start
+                        )
                         continue
 
                     if search_p2p:
@@ -761,6 +791,9 @@ class LMCacheEngine:
                         # TODO(Jiayi): We need to support pin for remote lookup
                         if self.lookup_server.lookup(key):
                             prev_end = end
+                            backend_hits["p2p"] = backend_hits.get("p2p", 0) + (
+                                end - start
+                            )
                             continue
                     end = prev_end
                     return prev_end
@@ -768,7 +801,7 @@ class LMCacheEngine:
             # all tokens where found, return the maximal end
             return end
         finally:
-            self.stats_monitor.on_lookup_finished(end)
+            self.stats_monitor.on_lookup_finished(end, backend_hits=backend_hits)
             # vllm lookup sets pin to True
             if pin:
                 self.storage_manager.touch_cache()
@@ -1122,7 +1155,7 @@ class LMCacheEngine:
         mask,
         ret_mask,
         **kwargs,
-    ) -> tuple[list[tuple[CacheEngineKey, MemoryObj, int, int]], int]:
+    ) -> tuple[list[tuple[CacheEngineKey, MemoryObj, int, int]], int, dict[str, int]]:
         """Process tokens and populate the reordered lists.
 
         This function is used to process tokens and populate the reordered lists.
@@ -1190,6 +1223,7 @@ class LMCacheEngine:
             block_mapping[location].append((key, start, end))
 
         last_failed_block_start = None
+        backend_tokens: dict[str, int] = {}
         for location, blocks in block_mapping.items():
             keys = [key for key, _, _ in blocks]
             memory_objs = self.storage_manager.batched_get(
@@ -1213,6 +1247,9 @@ class LMCacheEngine:
                     break
                 reordered_chunks.append((key, memory_obj, start, end))
                 tot_kv_size += memory_obj.get_size()
+                backend_tokens[location] = backend_tokens.get(location, 0) + (
+                    end - start
+                )
 
         if last_failed_block_start is not None:
             ret_mask[last_failed_block_start:] = False
@@ -1222,7 +1259,7 @@ class LMCacheEngine:
                 for key, memory_obj, start, end in reordered_chunks
                 if end < last_failed_block_start
             ]
-        return reordered_chunks, tot_kv_size
+        return reordered_chunks, tot_kv_size, backend_tokens
 
     def _broadcast_or_receive_memory_objs(
         self,

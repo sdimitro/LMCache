@@ -240,3 +240,55 @@ def test_zero_division_protection(stats_monitor):
     stats = stats_monitor.get_stats_and_clear()
     assert stats.retrieve_hit_rate == 0
     assert stats.lookup_hit_rate == 0
+
+
+def test_backend_specific_lookup_metrics(stats_monitor):
+    # Test per-backend lookup metrics
+    stats_monitor.on_lookup_request(num_tokens=100)
+    # Single call with backend breakdown
+    backend_hits = {"LocalCPUBackend": 60, "WekaGdsBackend": 40}
+    stats_monitor.on_lookup_finished(num_hit_tokens=100, backend_hits=backend_hits)
+
+    stats = stats_monitor.get_stats_and_clear()
+    assert stats.interval_lookup_hit_tokens == 100
+    assert stats.backend_lookup_hit_tokens == {
+        "LocalCPUBackend": 60,
+        "WekaGdsBackend": 40,
+    }
+
+
+def test_backend_specific_retrieve_metrics(stats_monitor):
+    # Test per-backend retrieve metrics
+    request_id = stats_monitor.on_retrieve_request(num_tokens=150)
+    # Single call with backend breakdown
+    backend_tokens = {"LocalCPUBackend": 90, "LocalDiskBackend": 60}
+    stats_monitor.on_retrieve_finished(
+        request_id=request_id, retrieved_tokens=150, backend_tokens=backend_tokens
+    )
+
+    stats = stats_monitor.get_stats_and_clear()
+    assert stats.interval_retrieve_retrieved_tokens == 150
+    assert stats.backend_retrieve_retrieved_tokens == {
+        "LocalCPUBackend": 90,
+        "LocalDiskBackend": 60,
+    }
+
+
+def test_backend_specific_store_metrics(stats_monitor):
+    # Test per-backend store metrics
+    request_id = stats_monitor.on_store_request(num_tokens=200)
+    # Single call with backend list
+    backends_used = ["LocalCPUBackend", "LocalDiskBackend", "RemoteBackend"]
+    stats_monitor.on_store_finished(
+        request_id=request_id, num_tokens=200, backends=backends_used
+    )
+
+    stats = stats_monitor.get_stats_and_clear()
+    assert (
+        stats.interval_store_stored_tokens == 200
+    )  # Total (not summed across backends)
+    assert stats.backend_store_stored_tokens == {
+        "LocalCPUBackend": 200,
+        "LocalDiskBackend": 200,
+        "RemoteBackend": 200,
+    }

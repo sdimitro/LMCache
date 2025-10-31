@@ -225,12 +225,14 @@ class StorageManager:
         memory_objs: List[MemoryObj],
         transfer_spec=None,  # TODO(Jiayi): add type check
         location: Optional[str] = None,
-    ) -> None:
+    ) -> List[str]:
         """
         Non-blocking function to batched put the memory objects into the
         storage backends.
         Do not store if the same object is being stored (handled here by
         storage manager) or has been stored (handled by storage backend).
+
+        :return: List of backend names that were targeted for storage
         """
 
         if self.enable_nixl or (location and location == "NixlBackend"):
@@ -269,6 +271,7 @@ class StorageManager:
                 memory_objs = cpu_memory_objs
                 keys = cpu_keys
 
+        backends_used = []
         for backend_name, backend in self.storage_backends.items():
             if backend_name == "NixlBackend":
                 continue
@@ -277,12 +280,15 @@ class StorageManager:
             # NOTE: the handling of exists_in_put_tasks
             # is done in the backend
             backend.batched_submit_put_task(keys, memory_objs)
+            backends_used.append(backend_name)
 
         if self.lookup_server is not None:
             self.lookup_server.batched_insert(keys)
 
         for memory_obj in memory_objs:
             memory_obj.ref_count_down()
+
+        return backends_used
 
     def get(
         self,
