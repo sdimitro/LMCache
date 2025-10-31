@@ -828,28 +828,28 @@ def contains_corrupted_metadata_test(backend: WekaGdsBackend):
         with open(metadata_path, "w") as f:
             f.write("dummy metadata")
 
-    # Mock the file reading to simulate a corrupted metadata file that exists but
-    # can't be read
-    def mock_open_side_effect(*args, **kwargs):
+    # Mock os.open to simulate a corrupted metadata file that exists but
+    # can't be read (WekaGdsBackend uses os.open, not builtins.open)
+    original_os_open = os.open
+
+    def mock_os_open(*args, **kwargs):
         if args[0] == metadata_path:
             raise OSError("Simulated file read error")
-        # For other files, use the real open
-        return unittest.mock.DEFAULT
+        # For other files, use the real os.open
+        return original_os_open(*args, **kwargs)
 
-    with unittest.mock.patch(
-        "builtins.open", side_effect=mock_open_side_effect
-    ) as mock_open:
+    with unittest.mock.patch("os.open", side_effect=mock_os_open) as mock_open:
         # This should not crash, but should return False and log an error
         result = backend.contains(k, False)
         # Should return False because metadata read failed
         assert result is False
-        # Verify that file was attempted to be opened
+        # Verify that os.open was attempted to be called
         mock_open.assert_called()
 
-        # Verify that the open call included our metadata file
+        # Verify that the os.open call included our metadata file
         calls = mock_open.call_args_list
         metadata_calls = [call for call in calls if call[0][0] == metadata_path]
-        assert len(metadata_calls) > 0, f"Expected call to open {metadata_path}"
+        assert len(metadata_calls) > 0, f"Expected call to os.open {metadata_path}"
 
 
 def test_weka_backend_contains_corrupted_metadata():
