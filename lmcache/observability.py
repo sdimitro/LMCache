@@ -60,6 +60,10 @@ class LMCacheStats:
     interval_local_cpu_evict_keys_count: int  # evict keys count
     interval_local_cpu_evict_failed_count: int  # evict failed count
 
+    # Weka GDS specific metrics
+    interval_weka_gds_read_ops: int  # number of GDS read operations
+    interval_weka_gds_read_bytes: int  # bytes read via GDS
+
     # Real time value measurements (will be reset after each log)
     retrieve_hit_rate: float
     lookup_hit_rate: float
@@ -167,6 +171,10 @@ class LMCStatsMonitor:
         self.interval_local_cpu_evict_count = 0
         self.interval_local_cpu_evict_keys_count = 0
         self.interval_local_cpu_evict_failed_count = 0
+
+        # Weka GDS specific metrics
+        self.interval_weka_gds_read_ops = 0
+        self.interval_weka_gds_read_bytes = 0
 
         self.local_cache_usage_bytes = 0
         self.remote_cache_usage_bytes = 0
@@ -390,6 +398,12 @@ class LMCStatsMonitor:
         self.interval_local_cpu_evict_failed_count += evict_failed_count
 
     @thread_safe
+    def update_weka_gds_read_metrics(self, read_ops: int, read_bytes: int):
+        """Update Weka GDS read metrics."""
+        self.interval_weka_gds_read_ops += read_ops
+        self.interval_weka_gds_read_bytes += read_bytes
+
+    @thread_safe
     def update_active_memory_objs_count(self, active_memory_objs_count: int):
         self.active_memory_objs_count = active_memory_objs_count
 
@@ -443,6 +457,10 @@ class LMCStatsMonitor:
         self.interval_local_cpu_evict_count = 0
         self.interval_local_cpu_evict_keys_count = 0
         self.interval_local_cpu_evict_failed_count = 0
+
+        # Clear Weka GDS metrics
+        self.interval_weka_gds_read_ops = 0
+        self.interval_weka_gds_read_bytes = 0
 
         new_retrieve_requests = {}
         for request_id, retrieve_stats in self.retrieve_requests.items():
@@ -531,6 +549,8 @@ class LMCStatsMonitor:
             interval_local_cpu_evict_count=self.interval_local_cpu_evict_count,
             interval_local_cpu_evict_keys_count=self.interval_local_cpu_evict_keys_count,
             interval_local_cpu_evict_failed_count=self.interval_local_cpu_evict_failed_count,
+            interval_weka_gds_read_ops=self.interval_weka_gds_read_ops,
+            interval_weka_gds_read_bytes=self.interval_weka_gds_read_bytes,
             local_cache_usage_bytes=self.local_cache_usage_bytes,
             remote_cache_usage_bytes=self.remote_cache_usage_bytes,
             local_storage_usage_bytes=self.local_storage_usage_bytes,
@@ -708,6 +728,19 @@ class PrometheusLogger:
         self.counter_local_cpu_evict_failed_count = self._counter_cls(
             name="lmcache:local_cpu_evict_failed_count",
             documentation="Total number of failed eviction in local cpu backend",
+            labelnames=labelnames,
+        )
+
+        # Weka GDS specific counters
+        self.counter_weka_gds_read_ops = self._counter_cls(
+            name="lmcache:weka_gds_read_ops",
+            documentation="Total number of GDS read operations",
+            labelnames=labelnames,
+        )
+
+        self.counter_weka_gds_read_bytes = self._counter_cls(
+            name="lmcache:weka_gds_read_bytes",
+            documentation="Total bytes read via GDS",
             labelnames=labelnames,
         )
 
@@ -1115,6 +1148,16 @@ class PrometheusLogger:
         self._log_counter(
             self.counter_local_cpu_evict_failed_count,
             stats.interval_local_cpu_evict_failed_count,
+        )
+
+        # Log Weka GDS metrics
+        self._log_counter(
+            self.counter_weka_gds_read_ops,
+            stats.interval_weka_gds_read_ops,
+        )
+        self._log_counter(
+            self.counter_weka_gds_read_bytes,
+            stats.interval_weka_gds_read_bytes,
         )
 
         self._log_gauge(self.gauge_retrieve_hit_rate, stats.retrieve_hit_rate)

@@ -328,3 +328,13 @@ def test_backend_latency_metrics(stats_monitor):
     assert "RemoteBackend" in stats.backend_put_latencies
     assert stats.backend_put_latencies["LocalCPUBackend"] == [3.1]
     assert stats.backend_put_latencies["RemoteBackend"] == [25.6]
+
+
+def test_weka_gds_metrics(stats_monitor):
+    # Test Weka GDS read metrics
+    stats_monitor.update_weka_gds_read_metrics(read_ops=5, read_bytes=1024000)
+    stats_monitor.update_weka_gds_read_metrics(read_ops=3, read_bytes=512000)
+
+    stats = stats_monitor.get_stats_and_clear()
+    assert stats.interval_weka_gds_read_ops == 8
+    assert stats.interval_weka_gds_read_bytes == 1536000

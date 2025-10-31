@@ -20,6 +20,7 @@ import torch
 # First Party
 from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import get_loguru, init_logger
+from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import (
     CacheEngineKey,
     DiskCacheMetadata,
@@ -292,6 +293,7 @@ class WekaGdsBackend(AllocatorBackendInterface):
             self._scan_metadata(), self.loop
         )
         self.save_metadata_tasks: set[asyncio.Task] = set()
+        self.stats_monitor = LMCStatsMonitor.GetOrCreate()
 
     async def _scan_metadata(self):
         # TODO(Serapheim): even though we only run it once on startup,
@@ -740,6 +742,10 @@ class WekaGdsBackend(AllocatorBackendInterface):
             f"Time taken for batched_get: {total_time:.3f}s |"
             f" {gds_read_bytes / 1024 / 1024}MiB | {gds_reads} ops."
         )
+
+        # Report GDS read metrics to stats monitor
+        self.stats_monitor.update_weka_gds_read_metrics(gds_reads, gds_read_bytes)
+
         return results
 
     async def _async_batched_get_blocking(

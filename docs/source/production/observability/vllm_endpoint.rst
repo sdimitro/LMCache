@@ -208,6 +208,15 @@ LMCache exposes a variety of metrics to monitor its performance. The following t
    * - ``lmcache:local_cpu_keys_in_request_count``
      - Gauge
      - The size of the keys in request
+   * - **Weka GDS Metrics**
+     - 
+     - 
+   * - ``lmcache:weka_gds_read_ops``
+     - Counter
+     - Total number of GDS read operations
+   * - ``lmcache:weka_gds_read_bytes``
+     - Counter
+     - Total bytes read via GDS
    * - **Memory Management Metrics**
      - 
      - 
@@ -285,5 +294,18 @@ The per-backend metrics allow you to break down performance by storage backend. 
    
    # Overall hit rate
    lmcache:retrieve_hit_rate
+
+**Weka GDS performance metrics:**
+
+.. code-block:: promql
+
+   # GDS read throughput (GB/s)
+   rate(lmcache:weka_gds_read_bytes[5m]) / 1024 / 1024 / 1024
+   
+   # GDS read operations per second
+   rate(lmcache:weka_gds_read_ops[5m])
+   
+   # Average bytes per GDS read operation
+   rate(lmcache:weka_gds_read_bytes[5m]) / rate(lmcache:weka_gds_read_ops[5m])
 
 
