@@ -3,7 +3,13 @@
 import pytest
 
 # First Party
-from lmcache.observability import LMCStatsMonitor
+from lmcache.observability import (
+    ERROR_ALLOC_FAILURES,
+    ERROR_IO_FAILURES,
+    ERROR_THRESHOLD,
+    ERROR_TIMEOUT,
+    LMCStatsMonitor,
+)
 
 
 @pytest.fixture(scope="function")
@@ -338,3 +344,22 @@ def test_weka_gds_metrics(stats_monitor):
     stats = stats_monitor.get_stats_and_clear()
     assert stats.interval_weka_gds_read_ops == 8
     assert stats.interval_weka_gds_read_bytes == 1536000
+
+
+def test_weka_gds_error_metrics(stats_monitor):
+    # Test Weka GDS error tracking by type
+    stats_monitor.update_weka_gds_error(ERROR_TIMEOUT)
+    stats_monitor.update_weka_gds_error(ERROR_TIMEOUT)
+    stats_monitor.update_weka_gds_error(ERROR_ALLOC_FAILURES)
+    stats_monitor.update_weka_gds_error(ERROR_THRESHOLD)
+    stats_monitor.update_weka_gds_error(ERROR_IO_FAILURES)
+    stats_monitor.update_weka_gds_error(ERROR_IO_FAILURES)
+    stats_monitor.update_weka_gds_error(ERROR_IO_FAILURES)
+
+    stats = stats_monitor.get_stats_and_clear()
+    assert stats.weka_gds_errors == {
+        ERROR_TIMEOUT: 2,
+        ERROR_ALLOC_FAILURES: 1,
+        ERROR_THRESHOLD: 1,
+        ERROR_IO_FAILURES: 3,
+    }

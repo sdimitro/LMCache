@@ -12,6 +12,12 @@ import torch
 
 # First Party
 from lmcache.config import LMCacheEngineMetadata
+from lmcache.observability import (
+    ERROR_IO_FAILURES,
+    ERROR_THRESHOLD,
+    ERROR_TIMEOUT,
+    LMCStatsMonitor,
+)
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import CuFileMemoryAllocator, MemoryFormat, MemoryObj
@@ -723,9 +729,13 @@ def get_blocking_cufile_read_failure_test(backend: WekaGdsBackend):
     future.result()
     assert backend.contains(k, False)
 
+    # Get stats monitor and clear initial state
+    stats_monitor = LMCStatsMonitor.GetOrCreate()
+    stats_monitor.get_stats_and_clear()
+
     with unittest.mock.patch.object(backend.cufile, "CuFile") as mock_cufile:
         mock_file = unittest.mock.MagicMock()
-        mock_file.read.side_effect = RuntimeError("CuFile read failed")
+        mock_file.read.return_value = -1  # Negative return indicates I/O error
         mock_cufile.return_value.__enter__ = unittest.mock.MagicMock(
             return_value=mock_file
         )
@@ -735,6 +745,12 @@ def get_blocking_cufile_read_failure_test(backend: WekaGdsBackend):
         returned_memory_obj = backend.get_blocking(k)
         # Should return None on read failure
         assert returned_memory_obj is None
+
+        # Verify I/O error was tracked
+        stats = stats_monitor.get_stats_and_clear()
+        assert stats.weka_gds_errors.get(ERROR_IO_FAILURES, 0) == 1, (
+            "Should have recorded 1 I/O failure"
+        )
 
 
 def test_weka_backend_get_blocking_cufile_read_failure():
@@ -869,6 +885,10 @@ def contains_timeout_test(backend: WekaGdsBackend):
     with backend.hot_lock:
         backend.hot_cache.clear()
 
+    # Clear initial error state
+    stats_monitor = LMCStatsMonitor.GetOrCreate()
+    stats_monitor.get_stats_and_clear()
+
     def slow_try_to_read_metadata(key):
         """Mock function that takes longer than timeout"""
         time.sleep(
@@ -882,6 +902,12 @@ def contains_timeout_test(backend: WekaGdsBackend):
         # This should not crash, but should return False and log timeout error
         result = backend.contains(k, False)
         assert result is False
+
+        # Verify timeout error was tracked
+        stats = stats_monitor.get_stats_and_clear()
+        assert stats.weka_gds_errors.get(ERROR_TIMEOUT, 0) == 1, (
+            "Should have recorded 1 timeout error"
+        )
 
 
 def test_contains_timeout():
@@ -898,6 +924,10 @@ def get_blocking_timeout_test(backend: WekaGdsBackend):
     future.result()
     assert backend.contains(k, False)
 
+    # Get initial error count
+    stats_monitor = LMCStatsMonitor.GetOrCreate()
+    stats_monitor.get_stats_and_clear()  # Clear any previous errors
+
     def slow_load_bytes_from_disk(key, path, dtype, shape):
         """Mock function that takes longer than timeout"""
         time.sleep(
@@ -913,6 +943,12 @@ def get_blocking_timeout_test(backend: WekaGdsBackend):
         # This should not crash, but should return None and log timeout error
         result = backend.get_blocking(k)
         assert result is None
+
+        # Verify timeout error was tracked
+        stats = stats_monitor.get_stats_and_clear()
+        assert stats.weka_gds_errors.get(ERROR_TIMEOUT, 0) == 1, (
+            "Should have recorded 1 timeout error"
+        )
 
 
 def test_get_blocking_timeout():
@@ -959,6 +995,10 @@ def contains_hang_threshold_test(backend: WekaGdsBackend):
     with backend.hot_lock:
         backend.hot_cache.clear()
 
+    # Get stats monitor and clear initial state
+    stats_monitor = LMCStatsMonitor.GetOrCreate()
+    stats_monitor.get_stats_and_clear()
+
     def slow_try_to_read_metadata(key):
         """Mock function that always times out"""
         time.sleep(
@@ -982,10 +1022,24 @@ def contains_hang_threshold_test(backend: WekaGdsBackend):
             backend.op_manager.get_failure_count() >= backend.op_manager._hang_threshold
         )
 
+        # Check we have timeout errors recorded
+        stats = stats_monitor.get_stats_and_clear()
+        timeout_errors = stats.weka_gds_errors.get(ERROR_TIMEOUT, 0)
+        assert timeout_errors == backend.op_manager._hang_threshold, (
+            f"Should have {backend.op_manager._hang_threshold} "
+            f"timeout errors, got {timeout_errors}"
+        )
+
         # Now the next call should trigger hang threshold
         result = backend.contains(k, False)
         # Should still return False, but due to hang threshold
         assert result is False
+
+        # Verify threshold error was tracked
+        stats = stats_monitor.get_stats_and_clear()
+        assert stats.weka_gds_errors.get(ERROR_THRESHOLD, 0) == 1, (
+            "Should have recorded 1 threshold error"
+        )
 
 
 def test_contains_hang_threshold():

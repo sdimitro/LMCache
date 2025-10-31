@@ -20,7 +20,13 @@ import torch
 # First Party
 from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import get_loguru, init_logger
-from lmcache.observability import LMCStatsMonitor
+from lmcache.observability import (
+    ERROR_ALLOC_FAILURES,
+    ERROR_IO_FAILURES,
+    ERROR_THRESHOLD,
+    ERROR_TIMEOUT,
+    LMCStatsMonitor,
+)
 from lmcache.utils import (
     CacheEngineKey,
     DiskCacheMetadata,
@@ -505,6 +511,7 @@ class WekaGdsBackend(AllocatorBackendInterface):
                 f"tensor_size_bytes={kv_chunk.nbytes}, error={e}",
                 exc_info=True,
             )
+            self.stats_monitor.update_weka_gds_error(ERROR_IO_FAILURES)
             with self.put_lock:
                 self.put_tasks.discard(key)
             return
@@ -525,6 +532,7 @@ class WekaGdsBackend(AllocatorBackendInterface):
                 f"tmp_suffix={tmp}, error={e}",
                 exc_info=True,
             )
+            self.stats_monitor.update_weka_gds_error(ERROR_IO_FAILURES)
             with self.hot_lock:
                 self.hot_cache.pop(key, None)
         with self.put_lock:
@@ -575,12 +583,14 @@ class WekaGdsBackend(AllocatorBackendInterface):
                 "Get blocking hang threshold reached. Will not run operation",
                 exc_info=True,
             )
+            self.stats_monitor.update_weka_gds_error(ERROR_THRESHOLD)
             return None
         except OperationTimeoutError:
             nu_logger.error(
                 f"Get blocking timed out after {self.timeout_get_blocking} seconds",
                 exc_info=True,
             )
+            self.stats_monitor.update_weka_gds_error(ERROR_TIMEOUT)
             return None
 
     def _load_bytes_from_disk_with_memory(
@@ -618,6 +628,7 @@ class WekaGdsBackend(AllocatorBackendInterface):
                 nu_logger.error(
                     f"Error loading {path}: ret: {ret} removing entry from cache"
                 )
+                self.stats_monitor.update_weka_gds_error(ERROR_IO_FAILURES)
                 with self.hot_lock:
                     self.hot_cache.pop(key)
             else:
@@ -627,6 +638,7 @@ class WekaGdsBackend(AllocatorBackendInterface):
                     f"Error loading {path}: got only {ret} bytes "
                     f"out of {logical_size}, ignoring"
                 )
+                self.stats_monitor.update_weka_gds_error(ERROR_IO_FAILURES)
             memory_obj.ref_count_down()
             return None
         return memory_obj
@@ -660,6 +672,7 @@ class WekaGdsBackend(AllocatorBackendInterface):
         memory_obj = self.memory_allocator.allocate(shape, dtype, fmt)
         if memory_obj is None:
             nu_logger.error("Memory allocation failed during sync disk load.")
+            self.stats_monitor.update_weka_gds_error(ERROR_ALLOC_FAILURES)
             return None
 
         return self._load_bytes_from_disk_with_memory(key, path, memory_obj)
@@ -680,6 +693,7 @@ class WekaGdsBackend(AllocatorBackendInterface):
                 "Batched get blocking hang threshold reached. Will not run operation",
                 exc_info=True,
             )
+            self.stats_monitor.update_weka_gds_error(ERROR_THRESHOLD)
             return [None] * len(keys)
         except OperationTimeoutError:
             nu_logger.error(
@@ -687,6 +701,7 @@ class WekaGdsBackend(AllocatorBackendInterface):
                 f"{self.timeout_batched_get_blocking} seconds",
                 exc_info=True,
             )
+            self.stats_monitor.update_weka_gds_error(ERROR_TIMEOUT)
             return [None] * len(keys)
 
     def _batched_get_blocking(
@@ -726,6 +741,7 @@ class WekaGdsBackend(AllocatorBackendInterface):
                 nu_logger.error(
                     f"Memory allocation failed during get_blocking for {path}"
                 )
+                self.stats_monitor.update_weka_gds_error(ERROR_ALLOC_FAILURES)
             else:
                 gds_reads += 1
                 gds_read_bytes += memory_obj.get_size()
@@ -828,18 +844,21 @@ class WekaGdsBackend(AllocatorBackendInterface):
             )
             if read_from_disk:
                 return True
+            return False  # Metadata not found or read failed
         except OperationHangThresholdReached:
             nu_logger.error(
                 "Contains hang threshold reached. Will not run operation",
                 exc_info=True,
             )
+            self.stats_monitor.update_weka_gds_error(ERROR_THRESHOLD)
             return False
         except OperationTimeoutError:
             nu_logger.error(
                 f"Contains timed out after {self.timeout_contains} seconds",
                 exc_info=True,
             )
-        return False
+            self.stats_monitor.update_weka_gds_error(ERROR_TIMEOUT)
+            return False
 
     async def _async_contains_slow_path(self, key: CacheEngineKey) -> bool:
         """
@@ -934,12 +953,10 @@ class WekaGdsBackend(AllocatorBackendInterface):
         if memory_obj is not None:
             return memory_obj
         if not busy_loop:
-            # TODO(Serapheim): print statistics about the allocation failure.
-            #                  both here and in the batched allocate() function.
-            # TODO(Serapheim): add prometheus statistics about the allocation failure.
             nu_logger.error(
                 "WekaGDS allocation failed and busy loop is disabled. Returning None."
             )
+            self.stats_monitor.update_weka_gds_error(ERROR_ALLOC_FAILURES)
             return None
 
         num_attempts = 0
@@ -953,9 +970,6 @@ class WekaGdsBackend(AllocatorBackendInterface):
             memory_obj = self.memory_allocator.allocate(shape, dtype, fmt)
             if memory_obj is not None:
                 break
-            # TODO(Serapheim): print statistics about the allocation failure.
-            #                  both here and in the batched allocate() function.
-            # TODO(Serapheim): add prometheus statistics about the allocation failure.
             num_attempts += 1
             nu_logger.warning(
                 f"Unable to allocate memory object after {num_attempts}"
@@ -966,6 +980,7 @@ class WekaGdsBackend(AllocatorBackendInterface):
                     "WekaGDS allocation failed after "
                     f"{self.max_alloc_attempts} attempts. Returning None."
                 )
+                self.stats_monitor.update_weka_gds_error(ERROR_ALLOC_FAILURES)
                 if not self.memory_allocator.memcheck():
                     nu_logger.error(
                         "WekaGDS allocation failed and memory allocator "
@@ -1012,6 +1027,7 @@ class WekaGdsBackend(AllocatorBackendInterface):
                 "WekaGDS batched allocation failed and "
                 "busy loop is disabled. Returning None."
             )
+            self.stats_monitor.update_weka_gds_error(ERROR_ALLOC_FAILURES)
             return None
 
         num_attempts = 0
@@ -1038,6 +1054,7 @@ class WekaGdsBackend(AllocatorBackendInterface):
                     "WekaGDS batched allocation failed after "
                     f"{self.max_alloc_attempts} attempts. Returning None."
                 )
+                self.stats_monitor.update_weka_gds_error(ERROR_ALLOC_FAILURES)
                 if not self.memory_allocator.memcheck():
                     nu_logger.error(
                         "WekaGDS batched allocation failed and memory allocator "

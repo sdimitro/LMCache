@@ -17,6 +17,12 @@ from lmcache.utils import thread_safe
 
 logger = init_logger(__name__)
 
+# Weka GDS Error Type Constants
+ERROR_TIMEOUT = "timeout"
+ERROR_ALLOC_FAILURES = "alloc_failures"
+ERROR_THRESHOLD = "threshold"
+ERROR_IO_FAILURES = "io_failures"
+
 
 @dataclass
 class LMCacheStats:
@@ -63,6 +69,7 @@ class LMCacheStats:
     # Weka GDS specific metrics
     interval_weka_gds_read_ops: int  # number of GDS read operations
     interval_weka_gds_read_bytes: int  # bytes read via GDS
+    weka_gds_errors: Dict[str, int]  # error_type -> count
 
     # Real time value measurements (will be reset after each log)
     retrieve_hit_rate: float
@@ -175,6 +182,7 @@ class LMCStatsMonitor:
         # Weka GDS specific metrics
         self.interval_weka_gds_read_ops = 0
         self.interval_weka_gds_read_bytes = 0
+        self.weka_gds_errors: Dict[str, int] = {}
 
         self.local_cache_usage_bytes = 0
         self.remote_cache_usage_bytes = 0
@@ -404,6 +412,16 @@ class LMCStatsMonitor:
         self.interval_weka_gds_read_bytes += read_bytes
 
     @thread_safe
+    def update_weka_gds_error(self, error_type: str):
+        """
+        Update Weka GDS error counter.
+
+        :param str error_type: One of the ERROR_* constants:
+            ERROR_TIMEOUT, ERROR_ALLOC_FAILURES, ERROR_THRESHOLD, ERROR_IO_FAILURES
+        """
+        self.weka_gds_errors[error_type] = self.weka_gds_errors.get(error_type, 0) + 1
+
+    @thread_safe
     def update_active_memory_objs_count(self, active_memory_objs_count: int):
         self.active_memory_objs_count = active_memory_objs_count
 
@@ -461,6 +479,7 @@ class LMCStatsMonitor:
         # Clear Weka GDS metrics
         self.interval_weka_gds_read_ops = 0
         self.interval_weka_gds_read_bytes = 0
+        self.weka_gds_errors.clear()
 
         new_retrieve_requests = {}
         for request_id, retrieve_stats in self.retrieve_requests.items():
@@ -551,6 +570,7 @@ class LMCStatsMonitor:
             interval_local_cpu_evict_failed_count=self.interval_local_cpu_evict_failed_count,
             interval_weka_gds_read_ops=self.interval_weka_gds_read_ops,
             interval_weka_gds_read_bytes=self.interval_weka_gds_read_bytes,
+            weka_gds_errors=self.weka_gds_errors.copy(),
             local_cache_usage_bytes=self.local_cache_usage_bytes,
             remote_cache_usage_bytes=self.remote_cache_usage_bytes,
             local_storage_usage_bytes=self.local_storage_usage_bytes,
@@ -742,6 +762,14 @@ class PrometheusLogger:
             name="lmcache:weka_gds_read_bytes",
             documentation="Total bytes read via GDS",
             labelnames=labelnames,
+        )
+
+        labelnames_with_error_type = labelnames + ["error_type"]
+        self.counter_weka_gds_errors = self._counter_cls(
+            name="lmcache:weka_gds_errors_total",
+            documentation="Total Weka GDS errors by type "
+            "(timeout, alloc_failures, threshold, io_failures)",
+            labelnames=labelnames_with_error_type,
         )
 
         self.gauge_retrieve_hit_rate = self._gauge_cls(
@@ -1159,6 +1187,12 @@ class PrometheusLogger:
             self.counter_weka_gds_read_bytes,
             stats.interval_weka_gds_read_bytes,
         )
+
+        # Log Weka GDS errors by type
+        for error_type, count in stats.weka_gds_errors.items():
+            if count > 0:
+                labels_with_error_type = {**self.labels, "error_type": error_type}
+                self.counter_weka_gds_errors.labels(**labels_with_error_type).inc(count)
 
         self._log_gauge(self.gauge_retrieve_hit_rate, stats.retrieve_hit_rate)
 

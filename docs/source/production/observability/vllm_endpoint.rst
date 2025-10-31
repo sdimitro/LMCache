@@ -217,6 +217,9 @@ LMCache exposes a variety of metrics to monitor its performance. The following t
    * - ``lmcache:weka_gds_read_bytes``
      - Counter
      - Total bytes read via GDS
+   * - ``lmcache:weka_gds_errors_total``
+     - Counter
+     - Total Weka GDS errors by type (labeled by error_type: timeout, alloc_failures, threshold, io_failures)
    * - **Memory Management Metrics**
      - 
      - 
@@ -307,5 +310,24 @@ The per-backend metrics allow you to break down performance by storage backend. 
    
    # Average bytes per GDS read operation
    rate(lmcache:weka_gds_read_bytes[5m]) / rate(lmcache:weka_gds_read_ops[5m])
+
+**Weka GDS error tracking:**
+
+.. code-block:: promql
+
+   # Total errors by type (stacked area chart)
+   sum by (error_type) (rate(lmcache:weka_gds_errors_total[5m]))
+   
+   # Timeout errors per second
+   rate(lmcache:weka_gds_errors_total{error_type="timeout"}[5m])
+   
+   # Allocation failures per second
+   rate(lmcache:weka_gds_errors_total{error_type="alloc_failures"}[5m])
+   
+   # I/O failures per second
+   rate(lmcache:weka_gds_errors_total{error_type="io_failures"}[5m])
+   
+   # Alert: High error rate
+   sum(rate(lmcache:weka_gds_errors_total[5m])) > 1
 
 
