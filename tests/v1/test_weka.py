@@ -834,7 +834,7 @@ def contains_corrupted_metadata_test(backend: WekaGdsBackend):
         backend.hot_cache.clear()
 
     # Get the metadata file path
-    path, subdir_key, _, _ = backend._key_to_path(k)
+    path = backend._key_to_path(k)
     metadata_path = path + ".metadata"
 
     # Verify the metadata file exists (skip if test environment doesn't persist files)
@@ -1609,8 +1609,6 @@ def batched_async_contains_mixed_cache_test(backend: WekaGdsBackend):
     # Step 2: Clear hot_cache to force disk lookup for A and B
     with backend.hot_lock:
         backend.hot_cache.clear()
-        # Also clear metadata dirs to simulate clean state
-        backend.metadata_dirs.clear()
 
     # Step 3: Store keys C, D, E (these will be in hot_cache)
     keys_cde = [key_c, key_d, key_e]
@@ -1637,7 +1635,6 @@ def batched_async_contains_mixed_cache_test(backend: WekaGdsBackend):
     # Clear hot_cache again to ensure we test the mixed scenario
     with backend.hot_lock:
         backend.hot_cache.clear()
-        backend.metadata_dirs.clear()
 
     # Re-add C, D, E to hot_cache by storing them again
     backend.batched_submit_put_task(
