@@ -30,7 +30,6 @@ from lmcache.observability import (
 from lmcache.utils import (
     CacheEngineKey,
     DiskCacheMetadata,
-    LayerCacheEngineKey,
     _lmcache_nvtx_annotate,
 )
 from lmcache.v1.config import LMCacheEngineConfig
@@ -197,13 +196,6 @@ class WekaGdsBackend(AllocatorBackendInterface):
     directly to the Weka Filesystem.  In order to use it, users need to specify
     `weka_path` and `cufile_buffer_size` in their LMCache config.
 
-    Cache Directory Structure created by this Backend:
-    /{weka_path}/{metadata_dir}/{first_level}/{second_level}/{data & metadata}
-    This structure is semi-arbitrary. WekaFS can handle/scale many small files
-    into a single directory so we could just put all the data/metadata directly
-    under the weka_path, but we create two levels in the directory hierarchy to
-    parallelize loading the data during initialization in the Python code.
-
     NOTE: The `weka_path` does not strictly need to be a WekaFS mount so if you
     want to test the backend without Weka you are free to do so for testing
     purposes. For production though it wouldn't scale as this backend is
@@ -295,77 +287,8 @@ class WekaGdsBackend(AllocatorBackendInterface):
         self._cufile_driver = self.cufile.CuFileDriver()
         assert hasattr(self.memory_allocator, "base_pointer")
         self.cufile_base_pointer = self.memory_allocator.base_pointer
-        self._scan_metadata_future = asyncio.run_coroutine_threadsafe(
-            self._scan_metadata(), self.loop
-        )
         self.save_metadata_tasks: set[asyncio.Task] = set()
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
-
-    async def _scan_metadata(self):
-        # TODO(Serapheim): even though we only run it once on startup,
-        # this is still not super scalable maybe we need to add metadata
-        # snapshotting later.
-        tasks = []
-        start = time.perf_counter()
-        with os.scandir(self.weka_path) as it:
-            for entry in it:
-                if not entry.is_dir():
-                    continue
-                l1_dir = os.path.basename(entry.name)
-                if len(l1_dir) != 2:
-                    continue
-                tasks.append(
-                    asyncio.to_thread(
-                        self._scan_metadata_subdir,
-                        os.path.join(self.weka_path, l1_dir),
-                        l1_dir,
-                    )
-                )
-        # TODO(Serapheim): If Python 3.11+, can we use TaskGroup instead?
-        await asyncio.gather(*tasks)
-        end = time.perf_counter()
-        nu_logger.info(
-            f"Read {len(self.hot_cache)} cache entries from persistent "
-            f"storage in {end - start:.2f} seconds"
-        )
-
-    def _scan_metadata_subdir(self, path, l1_dir):
-        target_suffix = _DATA_FILE_SUFFIX + _METADATA_FILE_SUFFIX
-        with os.scandir(path) as it:
-            for entry in it:
-                if not entry.is_dir():
-                    continue
-                l2_dir = os.path.basename(entry.name)
-                if len(l2_dir) != 2:
-                    continue
-                with os.scandir(os.path.join(path, l2_dir)) as it2:
-                    for fentry in it2:
-                        if not fentry.is_file():
-                            continue
-                        if not fentry.name.endswith(target_suffix):
-                            continue
-                        filename = os.path.basename(fentry.name)
-                        key_str = filename[: -len(target_suffix)].replace("_", "/")
-                        try:
-                            if self.layerwise:
-                                key = LayerCacheEngineKey.from_string(key_str)
-                            else:
-                                key = CacheEngineKey.from_string(key_str)
-                        except ValueError as e:
-                            nu_logger.error(
-                                f"Filename {filename} can't be converted "
-                                f"back into cache key: {e}"
-                            )
-                            continue
-                        try:
-                            self._import_key_with_metadata(
-                                key, fentry.path, l1_dir + l2_dir
-                            )
-                        except UnsupportedMetadataVersion:
-                            nu_logger.error(
-                                "Unsupported metadata version for "
-                                f"{fentry.path}, ignoring"
-                            )
 
     def _read_metadata_info(self, filename: str) -> Tuple[torch.Size, torch.dtype, int]:
         # Use O_NOATIME to prevent updating access time and improve performance
@@ -1064,14 +987,6 @@ class WekaGdsBackend(AllocatorBackendInterface):
         return memory_objs
 
     def close(self) -> None:
-        # Wait for metadata scanning to complete if it's still running
-        if hasattr(self, "_scan_metadata_future"):
-            try:
-                self._scan_metadata_future.result(timeout=10.0)
-                nu_logger.info("Metadata scanning completed during close.")
-            except Exception as e:
-                nu_logger.warning(f"Metadata scanning did not complete cleanly: {e}")
-
         self.op_manager.shutdown()
         self._thread_pool.shutdown(wait=True)
         nu_logger.info("Weka backend closed.")

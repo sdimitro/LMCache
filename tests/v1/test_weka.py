@@ -2140,11 +2140,162 @@ if __name__ == "__main__":
                 print(f"Cleaned up crash dump: {dump_file}")
 
 
+def test_hot_cache_lazy_loading():
+    """
+    Test that hot_cache is populated lazily on first lookup rather than pre-warming.
+
+    This test verifies:
+    1. hot_cache starts empty (no pre-warming)
+    2. Keys are stored and persisted to disk
+    3. contains() lazily populates hot_cache on first lookup
+    4. get_blocking() requires keys to be in hot_cache (populated by contains())
+    5. batched_get_blocking() requires keys to be in hot_cache (populated by contains())
+    """
+    WEKA_DIR = "/mnt/weka/test-cache-lazy-loading"
+    weka_backend = None
+    thread_loop = None
+    thread = None
+
+    try:
+        # Clean up any existing test directory
+        if os.path.exists(WEKA_DIR):
+            shutil.rmtree(WEKA_DIR)
+
+        os.makedirs(WEKA_DIR, exist_ok=True)
+        thread_loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=thread_loop.run_forever)
+        thread.start()
+
+        # Create backend
+        config = create_test_config(weka_path=WEKA_DIR)
+        weka_backend = create_test_backend(config, thread_loop)
+
+        # Verify hot_cache starts empty (no pre-warming)
+        with weka_backend.hot_lock:
+            initial_cache_size = len(weka_backend.hot_cache)
+        assert initial_cache_size == 0, (
+            f"Expected empty hot_cache, got {initial_cache_size} entries"
+        )
+
+        # Create test keys
+        key1 = create_test_key(chunk_hash=0xDEADBEEF)
+        key2 = create_test_key(chunk_hash=0xCAFEBABE)
+        key3 = create_test_key(chunk_hash=0xBADB0E)
+
+        # Store memory objects
+        memory_obj1 = create_test_memory_obj(weka_backend)
+        memory_obj2 = create_test_memory_obj(weka_backend)
+        memory_obj3 = create_test_memory_obj(weka_backend)
+
+        # Submit put tasks
+        future1 = weka_backend.submit_put_task(key1, memory_obj1)
+        future2 = weka_backend.submit_put_task(key2, memory_obj2)
+        future3 = weka_backend.submit_put_task(key3, memory_obj3)
+
+        # Wait for put tasks to complete
+        future1.result()
+        future2.result()
+        future3.result()
+
+        # Verify all keys are in hot_cache after storing
+        with weka_backend.hot_lock:
+            assert key1 in weka_backend.hot_cache, (
+                "Key1 should be in hot_cache after put"
+            )
+            assert key2 in weka_backend.hot_cache, (
+                "Key2 should be in hot_cache after put"
+            )
+            assert key3 in weka_backend.hot_cache, (
+                "Key3 should be in hot_cache after put"
+            )
+
+        # Clear hot_cache to simulate restart without actually restarting
+        with weka_backend.hot_lock:
+            weka_backend.hot_cache.clear()
+
+        # Verify hot_cache is now empty
+        with weka_backend.hot_lock:
+            assert len(weka_backend.hot_cache) == 0, (
+                "hot_cache should be empty after clear"
+            )
+
+        # Test 1: get_blocking() should fail without contains() being called first
+        retrieved_obj = weka_backend.get_blocking(key1)
+        assert retrieved_obj is None, (
+            "get_blocking() should return None when key not in hot_cache"
+        )
+
+        # Verify hot_cache is still empty
+        with weka_backend.hot_lock:
+            assert len(weka_backend.hot_cache) == 0, "hot_cache should still be empty"
+
+        # Test 2: contains() should lazily load metadata
+        result = weka_backend.contains(key1, False)
+        assert result is True, "Key1 should exist on disk"
+
+        # Verify key1 is now in hot_cache (lazily loaded by contains)
+        with weka_backend.hot_lock:
+            assert key1 in weka_backend.hot_cache, (
+                "Key1 should be in hot_cache after contains()"
+            )
+            assert key2 not in weka_backend.hot_cache, (
+                "Key2 should not be in hot_cache yet"
+            )
+            assert key3 not in weka_backend.hot_cache, (
+                "Key3 should not be in hot_cache yet"
+            )
+
+        # Test 3: Now get_blocking() should work since contains() populated hot_cache
+        retrieved_obj1 = weka_backend.get_blocking(key1)
+        assert retrieved_obj1 is not None, "Key1 should be retrievable after contains()"
+        assert retrieved_obj1.get_size() == memory_obj1.get_size(), "Size should match"
+
+        # Test 4: Use contains() to populate hot_cache for key2 and key3
+        assert weka_backend.contains(key2, False), "Key2 should exist"
+        assert weka_backend.contains(key3, False), "Key3 should exist"
+
+        # Verify all keys are now in hot_cache
+        with weka_backend.hot_lock:
+            assert key1 in weka_backend.hot_cache, "Key1 should be in hot_cache"
+            assert key2 in weka_backend.hot_cache, "Key2 should be in hot_cache"
+            assert key3 in weka_backend.hot_cache, "Key3 should be in hot_cache"
+
+        # Test 5: batched_get_blocking() should work now that hot_cache is populated
+        retrieved_objs = weka_backend.batched_get_blocking([key1, key2, key3])
+        assert len(retrieved_objs) == 3, "Should retrieve three objects"
+        for i, obj in enumerate(retrieved_objs):
+            assert obj is not None, f"Object {i} should be retrievable"
+
+        # Test 6: Clear cache and verify batched_get_blocking fails without contains()
+        with weka_backend.hot_lock:
+            weka_backend.hot_cache.clear()
+
+        retrieved_objs = weka_backend.batched_get_blocking([key1, key2, key3])
+        assert len(retrieved_objs) == 3, "Should return list with 3 entries"
+        for obj in retrieved_objs:
+            assert obj is None, "All objects should be None when hot_cache is empty"
+
+        print("✓ All lazy loading tests passed!")
+
+    finally:
+        # Cleanup
+        if weka_backend is not None:
+            weka_backend.close()
+
+        if thread_loop is not None and thread_loop.is_running():
+            thread_loop.call_soon_threadsafe(thread_loop.stop)
+        if thread is not None and thread.is_alive():
+            thread.join()
+
+        if os.path.exists(WEKA_DIR):
+            shutil.rmtree(WEKA_DIR, ignore_errors=True)
+
+
 def test_scan_metadata_persistence():
     """
-    Test that _scan_metadata() correctly loads metadata from disk after restart.
-    This validates the refactored _scan_metadata_subdir() and
-    _import_key_with_metadata() methods to ensure no regressions were introduced.
+    Test that metadata persists across backend restarts and is lazily loaded.
+    This validates that the lazy-loading mechanism correctly reads metadata
+    from disk when keys are accessed after a restart.
     """
     WEKA_DIR = "/mnt/weka/test-cache-scan-metadata"
     weka_backend = None
@@ -2210,37 +2361,41 @@ def test_scan_metadata_persistence():
             }
 
         # Close the backend to simulate shutdown
-        initial_cache_size = len(weka_backend.hot_cache)
         weka_backend.close()
         weka_backend = None
 
         # Give time for async cleanup
         time.sleep(0.5)
 
-        # Create a new backend - this will trigger _scan_metadata()
+        # Create a new backend - with lazy loading, hot_cache should be empty
         weka_backend = create_test_backend(config, thread_loop)
 
-        # Wait for scan_metadata to complete
-        scan_future = weka_backend._scan_metadata_future
-        assert scan_future is not None, "Scan metadata future should exist"
-        scan_future.result(timeout=30.0)
-
-        # Verify the cache was repopulated from disk
-        assert len(weka_backend.hot_cache) == initial_cache_size, (
-            f"Expected {initial_cache_size} entries, got {len(weka_backend.hot_cache)}"
+        # Verify hot_cache is empty (no pre-warming)
+        with weka_backend.hot_lock:
+            cache_size = len(weka_backend.hot_cache)
+        assert cache_size == 0, (
+            f"Expected empty hot_cache after restart (lazy loading), "
+            f"got {cache_size} entries"
         )
 
-        # Verify all keys are still accessible
+        # Verify all keys are still accessible (will trigger lazy loading)
         for key in test_keys:
             assert weka_backend.contains(key, False), (
-                f"Key {key} should be in cache after restart"
+                f"Key {key} should be accessible after restart"
             )
+
+        # Now hot_cache should have been populated by contains() calls
+        with weka_backend.hot_lock:
+            cache_size = len(weka_backend.hot_cache)
+        assert cache_size == len(test_keys), (
+            f"Expected {len(test_keys)} entries after lazy loading, got {cache_size}"
+        )
 
         # Verify metadata was correctly loaded
         for key, expected in expected_metadata.items():
             metadata = weka_backend.hot_cache.get(key)
             assert metadata is not None, (
-                f"Metadata for key {key} should exist after restart"
+                f"Metadata for key {key} should exist after lazy loading"
             )
             assert metadata.shape == expected["shape"], (
                 f"Shape mismatch for {key}: expected {expected['shape']}, "
@@ -2254,8 +2409,7 @@ def test_scan_metadata_persistence():
                 f"Size mismatch for {key}: expected {expected['size']}, "
                 f"got {metadata.size}"
             )
-            # Note: fmt might be None initially but gets set correctly during reload
-            # For non-layerwise mode, it should be KV_2LTD after reload
+            # For non-layerwise mode, it should be KV_2LTD
             assert metadata.fmt == MemoryFormat.KV_2LTD, (
                 f"Format should be KV_2LTD for non-layerwise mode, got {metadata.fmt}"
             )
@@ -2278,7 +2432,7 @@ def test_scan_metadata_persistence():
                 "Dtype should match"
             )
 
-        print(f"✓ Successfully scanned and loaded {len(test_keys)} entries from disk")
+        print(f"✓ Successfully lazily loaded {len(test_keys)} entries from disk")
 
     finally:
         # Cleanup
