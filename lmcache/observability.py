@@ -69,6 +69,8 @@ class LMCacheStats:
     # Weka GDS specific metrics
     interval_weka_gds_read_ops: int  # number of GDS read operations
     interval_weka_gds_read_bytes: int  # bytes read via GDS
+    interval_weka_gds_write_ops: int  # number of GDS write operations
+    interval_weka_gds_write_bytes: int  # bytes written via GDS
     weka_gds_errors: Dict[str, int]  # error_type -> count
 
     # Real time value measurements (will be reset after each log)
@@ -182,6 +184,8 @@ class LMCStatsMonitor:
         # Weka GDS specific metrics
         self.interval_weka_gds_read_ops = 0
         self.interval_weka_gds_read_bytes = 0
+        self.interval_weka_gds_write_ops = 0
+        self.interval_weka_gds_write_bytes = 0
         self.weka_gds_errors: Dict[str, int] = {}
 
         self.local_cache_usage_bytes = 0
@@ -412,6 +416,12 @@ class LMCStatsMonitor:
         self.interval_weka_gds_read_bytes += read_bytes
 
     @thread_safe
+    def update_weka_gds_write_metrics(self, write_ops: int, write_bytes: int):
+        """Update Weka GDS write metrics."""
+        self.interval_weka_gds_write_ops += write_ops
+        self.interval_weka_gds_write_bytes += write_bytes
+
+    @thread_safe
     def update_weka_gds_error(self, error_type: str):
         """
         Update Weka GDS error counter.
@@ -479,6 +489,8 @@ class LMCStatsMonitor:
         # Clear Weka GDS metrics
         self.interval_weka_gds_read_ops = 0
         self.interval_weka_gds_read_bytes = 0
+        self.interval_weka_gds_write_ops = 0
+        self.interval_weka_gds_write_bytes = 0
         self.weka_gds_errors.clear()
 
         new_retrieve_requests = {}
@@ -570,6 +582,8 @@ class LMCStatsMonitor:
             interval_local_cpu_evict_failed_count=self.interval_local_cpu_evict_failed_count,
             interval_weka_gds_read_ops=self.interval_weka_gds_read_ops,
             interval_weka_gds_read_bytes=self.interval_weka_gds_read_bytes,
+            interval_weka_gds_write_ops=self.interval_weka_gds_write_ops,
+            interval_weka_gds_write_bytes=self.interval_weka_gds_write_bytes,
             weka_gds_errors=self.weka_gds_errors.copy(),
             local_cache_usage_bytes=self.local_cache_usage_bytes,
             remote_cache_usage_bytes=self.remote_cache_usage_bytes,
@@ -761,6 +775,18 @@ class PrometheusLogger:
         self.counter_weka_gds_read_bytes = self._counter_cls(
             name="lmcache:weka_gds_read_bytes",
             documentation="Total bytes read via GDS",
+            labelnames=labelnames,
+        )
+
+        self.counter_weka_gds_write_ops = self._counter_cls(
+            name="lmcache:weka_gds_write_ops",
+            documentation="Total number of GDS write operations",
+            labelnames=labelnames,
+        )
+
+        self.counter_weka_gds_write_bytes = self._counter_cls(
+            name="lmcache:weka_gds_write_bytes",
+            documentation="Total bytes written via GDS",
             labelnames=labelnames,
         )
 
@@ -1186,6 +1212,14 @@ class PrometheusLogger:
         self._log_counter(
             self.counter_weka_gds_read_bytes,
             stats.interval_weka_gds_read_bytes,
+        )
+        self._log_counter(
+            self.counter_weka_gds_write_ops,
+            stats.interval_weka_gds_write_ops,
+        )
+        self._log_counter(
+            self.counter_weka_gds_write_bytes,
+            stats.interval_weka_gds_write_bytes,
         )
 
         # Log Weka GDS errors by type

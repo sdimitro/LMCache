@@ -346,6 +346,16 @@ def test_weka_gds_metrics(stats_monitor):
     assert stats.interval_weka_gds_read_bytes == 1536000
 
 
+def test_weka_gds_write_metrics(stats_monitor):
+    # Test Weka GDS write metrics
+    stats_monitor.update_weka_gds_write_metrics(write_ops=4, write_bytes=2048000)
+    stats_monitor.update_weka_gds_write_metrics(write_ops=6, write_bytes=3072000)
+
+    stats = stats_monitor.get_stats_and_clear()
+    assert stats.interval_weka_gds_write_ops == 10
+    assert stats.interval_weka_gds_write_bytes == 5120000
+
+
 def test_weka_gds_error_metrics(stats_monitor):
     # Test Weka GDS error tracking by type
     stats_monitor.update_weka_gds_error(ERROR_TIMEOUT)

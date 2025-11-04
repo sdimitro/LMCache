@@ -424,14 +424,22 @@ class WekaGdsBackend(AllocatorBackendInterface):
         Asynchronously submit multiple put tasks in batch.
         The loop happens in the async context so it doesn't block the caller.
         """
-        # Create all async tasks
+        gds_writes, gds_write_bytes = 0, 0
         tasks = []
         for key, memory_obj in zip(keys, memory_objs, strict=False):
             task = self._async_save_bytes_to_disk(key, memory_obj)
             tasks.append(task)
+            gds_writes += 1
+            gds_write_bytes += memory_obj.get_size()
 
-        # Execute all tasks concurrently
+        start_time = time.perf_counter()
         await asyncio.gather(*tasks)
+        total_time = time.perf_counter() - start_time
+        logger.info(
+            f"Time taken for batched_put: {total_time:.3f}s |"
+            f" {gds_write_bytes / 1024 / 1024}MiB | {gds_writes} ops."
+        )
+        self.stats_monitor.update_weka_gds_write_metrics(gds_writes, gds_write_bytes)
 
     async def _async_save_bytes_to_disk(
         self,
