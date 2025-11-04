@@ -155,6 +155,85 @@ def test_weka_backend_sanity():
     init_and_teardown(basic_store_load_test)
 
 
+def batched_submit_put_task_returns_immediately(backend: WekaGdsBackend):
+    """Test that batched_submit_put_task returns immediately without blocking"""
+    keys = []
+    for chunk_hash in [0xDEADBEEF, 0xCAFEBABE, 0xBADB0E]:
+        keys.append(create_test_key(chunk_hash=chunk_hash))
+    memory_objs = [create_test_memory_obj(backend) for _ in range(len(keys))]
+
+    # Measure how long batched_submit_put_task takes to return
+    start_time = time.perf_counter()
+    backend.batched_submit_put_task(keys, memory_objs)
+    end_time = time.perf_counter()
+    elapsed_ms = (end_time - start_time) * 1000
+
+    # Verify it returns quickly (non-blocking) - should be < 100ms
+    # since it only schedules the work without waiting
+    assert elapsed_ms < 100, (
+        f"batched_submit_put_task took {elapsed_ms:.2f}ms, "
+        "expected < 100ms (non-blocking)"
+    )
+
+    # Verify all keys are marked as pending put tasks
+    for key in keys:
+        assert backend.exists_in_put_tasks(key), (
+            f"Key {key} should be in put_tasks after batched_submit_put_task"
+        )
+
+    # Wait for all put tasks to complete
+    timeout = 30.0
+    start_wait = time.time()
+    while time.time() - start_wait < timeout:
+        keys_still_pending = [key for key in keys if backend.exists_in_put_tasks(key)]
+        if not keys_still_pending:
+            break
+        time.sleep(0.1)
+    else:
+        raise TimeoutError(f"Put tasks did not complete within {timeout} seconds")
+
+    # Verify all keys are no longer in put_tasks
+    for key in keys:
+        assert not backend.exists_in_put_tasks(key), (
+            f"Key {key} should not be in put_tasks after completion"
+        )
+
+    # Verify all keys are stored correctly
+    for key in keys:
+        assert backend.contains(key), f"Key {key} should be stored after completion"
+
+    # Verify we can retrieve the stored objects
+    returned_memory_objs = backend.batched_get_blocking(keys)
+    assert returned_memory_objs is not None
+    assert len(returned_memory_objs) == len(keys)
+    for returned_obj, original_obj in zip(
+        returned_memory_objs, memory_objs, strict=True
+    ):
+        assert returned_obj is not None
+        assert returned_obj.get_size() == original_obj.get_size()
+        assert returned_obj.get_shape() == original_obj.get_shape()
+        assert returned_obj.get_dtype() == original_obj.get_dtype()
+
+
+def test_weka_backend_batched_submit_put_task():
+    init_and_teardown(batched_submit_put_task_returns_immediately)
+
+
+def batched_submit_put_task_empty_list(backend: WekaGdsBackend):
+    """Test that batched_submit_put_task handles empty lists correctly"""
+    # Test with empty lists - should not raise any errors
+    backend.batched_submit_put_task([], [])
+
+    # Give it a moment to ensure no async errors occur
+    time.sleep(0.1)
+
+    # No errors should occur - test passes if we reach here
+
+
+def test_weka_backend_batched_submit_put_task_empty():
+    init_and_teardown(batched_submit_put_task_empty_list)
+
+
 def basic_batch_store_load_test(backend: WekaGdsBackend):
     keys = []
     for chunk_hash in [0xDEADBEEF, 0xCAFEBABE, 0xBADB0E]:

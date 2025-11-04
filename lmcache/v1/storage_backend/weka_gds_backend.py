@@ -402,8 +402,36 @@ class WekaGdsBackend(AllocatorBackendInterface):
         memory_objs: List[MemoryObj],
         transfer_spec=None,
     ) -> None:
+        # Increment ref counts and mark keys as pending synchronously
+        # so they're immediately visible to callers
+        for memory_obj in memory_objs:
+            memory_obj.ref_count_up()
+
+        with self.put_lock:
+            self.put_tasks.update(keys)
+
+        # Offload the entire batch operation to the async loop
+        asyncio.run_coroutine_threadsafe(
+            self._async_batched_submit(keys, memory_objs), self.loop
+        )
+
+    async def _async_batched_submit(
+        self,
+        keys: Sequence[CacheEngineKey],
+        memory_objs: List[MemoryObj],
+    ) -> None:
+        """
+        Asynchronously submit multiple put tasks in batch.
+        The loop happens in the async context so it doesn't block the caller.
+        """
+        # Create all async tasks
+        tasks = []
         for key, memory_obj in zip(keys, memory_objs, strict=False):
-            self.submit_put_task(key, memory_obj)
+            task = self._async_save_bytes_to_disk(key, memory_obj)
+            tasks.append(task)
+
+        # Execute all tasks concurrently
+        await asyncio.gather(*tasks)
 
     async def _async_save_bytes_to_disk(
         self,
@@ -438,6 +466,7 @@ class WekaGdsBackend(AllocatorBackendInterface):
                 exc_info=True,
             )
             self.stats_monitor.update_weka_gds_error(ERROR_IO_FAILURES)
+            memory_obj.ref_count_down()
             with self.put_lock:
                 self.put_tasks.discard(key)
             return
