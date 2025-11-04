@@ -913,7 +913,7 @@ def contains_corrupted_metadata_test(backend: WekaGdsBackend):
         backend.hot_cache.clear()
 
     # Get the metadata file path
-    path = backend._key_to_path(k)
+    path, _, _, _ = backend._key_to_path(k)
     metadata_path = path + ".metadata"
 
     # Verify the metadata file exists (skip if test environment doesn't persist files)
