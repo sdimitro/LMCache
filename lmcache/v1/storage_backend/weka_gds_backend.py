@@ -286,6 +286,7 @@ class WekaGdsBackend(AllocatorBackendInterface):
         self._cufile_driver = self.cufile.CuFileDriver()
         assert hasattr(self.memory_allocator, "base_pointer")
         self.cufile_base_pointer = self.memory_allocator.base_pointer
+        self.save_metadata_tasks: set[asyncio.Task] = set()
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
 
     def _read_metadata_info(self, filename: str) -> Tuple[torch.Size, torch.dtype, int]:
@@ -425,8 +426,11 @@ class WekaGdsBackend(AllocatorBackendInterface):
         memory_obj.ref_count_down()
 
         try:
-            # Wait for metadata write to complete before returning
-            await save_metadata(path + _METADATA_FILE_SUFFIX, tmp, metadata)
+            task = asyncio.create_task(
+                save_metadata(path + _METADATA_FILE_SUFFIX, tmp, metadata)
+            )
+            self.save_metadata_tasks.add(task)
+            task.add_done_callback(self.save_metadata_tasks.discard)
         except Exception as e:
             nu_logger.error(
                 f"POSIX metadata write operation failed for key {key} at path "
