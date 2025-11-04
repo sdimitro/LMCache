@@ -269,6 +269,7 @@ def setup_weka_backend(
     import threading
 
     # First Party
+    from lmcache.config import LMCacheEngineMetadata
     from lmcache.v1.memory_management import CuFileMemoryAllocator
 
     # Create config
@@ -324,9 +325,22 @@ def setup_weka_backend(
             ) from e
         raise
 
+    # Create metadata for the backend
+    # kv_shape: (num_layer, 2, chunk_size, num_kv_head, head_size)
+    metadata = LMCacheEngineMetadata(
+        model_name="batched-put-benchmark",
+        world_size=1,
+        worker_id=0,
+        fmt="vllm",
+        kv_dtype=torch.bfloat16,
+        kv_shape=(num_layers, 2, chunk_size, num_heads, head_size),
+        use_mla=False,
+    )
+
     # Create Weka backend with proper parameters
     backend = WekaGdsBackend(
         config=config,
+        metadata=metadata,
         loop=loop,
         memory_allocator=memory_allocator,
         dst_device=device,

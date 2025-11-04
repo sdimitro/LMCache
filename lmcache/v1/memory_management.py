@@ -1805,7 +1805,9 @@ class CuFileMemoryAllocator(GPUMemoryAllocator):
         cuFileBufRegister(ctypes.c_void_p(self.base_pointer), size, flags=0)
 
     def __del__(self):
-        self.cuFileBufDeregister(ctypes.c_void_p(self.base_pointer))
+        # Only deregister if we successfully registered the buffer
+        if hasattr(self, "base_pointer"):
+            self.cuFileBufDeregister(ctypes.c_void_p(self.base_pointer))
 
     def __str__(self):
         return "CuFileMemoryAllocator"
