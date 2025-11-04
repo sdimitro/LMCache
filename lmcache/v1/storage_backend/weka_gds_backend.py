@@ -258,6 +258,7 @@ class WekaGdsBackend(AllocatorBackendInterface):
 
         self.hot_lock = threading.Lock()
         self.hot_cache: OrderedDict[CacheEngineKey, DiskCacheMetadata] = OrderedDict()
+        self.metadata_dirs: set[str] = set()
 
         self.put_lock = threading.Lock()
         self.put_tasks: set[CacheEngineKey] = set()
@@ -306,7 +307,12 @@ class WekaGdsBackend(AllocatorBackendInterface):
             os.close(fd)
         return unpack_metadata(buf)
 
-    def _import_key_with_metadata(self, key: CacheEngineKey, filename: str):
+    def _import_key_with_metadata(
+        self,
+        key: CacheEngineKey,
+        filename: str,
+        subdir_key: str,
+    ):
         shape, dtype, size = self._read_metadata_info(filename)
         # Set the appropriate memory format for layerwise operations
         fmt = None
@@ -318,6 +324,7 @@ class WekaGdsBackend(AllocatorBackendInterface):
             filename.removesuffix(_METADATA_FILE_SUFFIX), size, shape, dtype, fmt
         )
         with self.hot_lock:
+            self.metadata_dirs.add(subdir_key)
             self.hot_cache[key] = metadata
         return metadata
 
@@ -333,11 +340,11 @@ class WekaGdsBackend(AllocatorBackendInterface):
         return self._contains_slow_path(key)
 
     def _try_to_read_metadata(self, key: CacheEngineKey) -> Optional[DiskCacheMetadata]:
-        path = self._key_to_path(key)
+        path, subdir_key, _, _ = self._key_to_path(key)
         path += _METADATA_FILE_SUFFIX
         if os.path.exists(path):
             try:
-                return self._import_key_with_metadata(key, path)
+                return self._import_key_with_metadata(key, path, subdir_key)
             except UnsupportedMetadataVersion:
                 logger.error(f"Unsupported metadata version for {path}, ignoring")
             except (OSError, IOError) as e:
@@ -356,12 +363,22 @@ class WekaGdsBackend(AllocatorBackendInterface):
     def _key_to_path(
         self,
         key: CacheEngineKey,
-    ) -> str:
+    ) -> Tuple[str, str, str, str]:
+        hash = str(key.chunk_hash)
+        l1_dir = hash[:2]
+        l2_dir = hash[2:4]
         key_str = key.to_string()
         assert "_" not in key_str, "key string should not contain `_`"
-        return os.path.join(
-            self.weka_path,
-            key_str.replace("/", "_") + _DATA_FILE_SUFFIX,
+        return (
+            os.path.join(
+                self.weka_path,
+                l1_dir,
+                l2_dir,
+                key_str.replace("/", "_") + _DATA_FILE_SUFFIX,
+            ),
+            l1_dir + l2_dir,
+            l1_dir,
+            l2_dir,
         )
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
@@ -398,7 +415,10 @@ class WekaGdsBackend(AllocatorBackendInterface):
         """
         kv_chunk = memory_obj.tensor
         assert kv_chunk is not None
-        path = self._key_to_path(key)
+        path, subdir_key, l1_dir, l2_dir = self._key_to_path(key)
+        if subdir_key not in self.metadata_dirs:
+            os.makedirs(os.path.join(self.weka_path, l1_dir, l2_dir), exist_ok=True)
+            self.metadata_dirs.add(subdir_key)
         tmp = ".tmp" + rand_suffix(self.rand, 8)
 
         try:
@@ -445,7 +465,7 @@ class WekaGdsBackend(AllocatorBackendInterface):
             self.put_tasks.discard(key)
 
     def insert_key(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
-        path = self._key_to_path(key)
+        path, _, _, _ = self._key_to_path(key)
         size = memory_obj.get_size()  # Use logical size to match what's stored in file
         shape = memory_obj.metadata.shape
         dtype = memory_obj.metadata.dtype
