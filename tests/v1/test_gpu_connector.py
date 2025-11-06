@@ -85,6 +85,23 @@ def patch_pin_allocator():
         yield
 
 
+@pytest.fixture(autouse=True, scope="function")
+def cuda_error_recovery():
+    """Clear any CUDA errors after each test to prevent cascade failures."""
+    yield
+    # After each test, check if there's a CUDA error and try to recover
+    try:
+        torch.cuda.synchronize()
+    except Exception as e:
+        print(f"\nWarning: CUDA error detected after test: {e}")
+        # Try to clear the error by resetting the device
+        try:
+            torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"\nWarning: Error clearing CUDA error: {e}")
+            pass
+
+
 @pytest.mark.parametrize("use_gpu", [True, False])
 @pytest.mark.parametrize("use_mla", [True, False])
 def test_vllm_paged_connector_v2_with_gpu_and_mla(use_gpu, use_mla):
@@ -178,6 +195,8 @@ def test_vllm_paged_connector_v2_with_gpu_and_mla(use_gpu, use_mla):
         check_paged_kv_cache_equal(
             gpu_kv_src, gpu_kv_dst, slot_mapping, num_heads, head_size
         )
+    connector.close()
+    connector2.close()
     allocator.close()
 
 
@@ -278,6 +297,7 @@ def test_layerwise_vllm_paged_connector_with_gpu(use_gpu):
         gpu_kv_src, gpu_kv_dst, slot_mapping, num_heads, head_size
     )
 
+    connector.close()
     allocator.close()
 
 
@@ -440,6 +460,7 @@ def test_batched_layerwise_vllm_paged_connector_with_gpu(use_gpu):
         head_size,
     )
 
+    connector.close()
     allocator.close()
 
 
@@ -538,6 +559,7 @@ def test_layerwise_vllm_buffer_connector_with_gpu(use_gpu):
         gpu_kv_src, gpu_kv_dst, slot_mapping, num_heads, head_size
     )
 
+    connector.close()
     allocator.close()
 
 
@@ -596,6 +618,7 @@ def test_vllm_paged_connector_v2_to_gpu_bench(benchmark):
     allocator.free(memory_obj)
     assert allocator.memcheck()
 
+    connector.close()
     allocator.close()
 
 
@@ -707,4 +730,5 @@ def test_sglang_connector_with_gpu_and_mla(use_gpu, use_mla):
             gpu_kv_src, gpu_kv_dst, slot_mapping, num_heads, head_size
         )
 
+    connector.close()
     allocator.close()

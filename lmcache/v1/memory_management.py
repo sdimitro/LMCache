@@ -1701,6 +1701,11 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
         with self.device_mem_lock:
             return self.allocator.memcheck()
 
+    def close(self):
+        """Clean up GPU tensor memory."""
+        if hasattr(self, "tensor"):
+            del self.tensor
+
     def __str__(self):
         return "GPUMemoryAllocator"
 

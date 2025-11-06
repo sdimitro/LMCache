@@ -2273,6 +2273,9 @@ def test_hot_cache_lazy_loading():
         future2.result()
         future3.result()
 
+        # Wait for metadata files to be written to disk
+        weka_backend.wait_for_metadata_tasks()
+
         # Verify all keys are in hot_cache after storing
         with weka_backend.hot_lock:
             assert key1 in weka_backend.hot_cache, (

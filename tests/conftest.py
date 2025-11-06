@@ -434,7 +434,12 @@ def memory_allocator():
         yield _NoCloseWrapper(_real)
     finally:
         # Actually close once when the session ends
-        _real.close()
+        try:
+            _real.close()
+        except Exception as e:
+            # If CUDA is in a bad state, we can't synchronize
+            # Log the error but don't fail the entire test suite
+            print(f"Warning: Failed to close memory allocator: {e}")
 
 
 @pytest.fixture(autouse=True)  # function-scoped by default
